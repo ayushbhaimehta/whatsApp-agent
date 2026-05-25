@@ -1,0 +1,21 @@
+# Dependency directories
+node_modules/
+
+# Local environment configuration
+.env
+
+# Google API Credentials (extremely sensitive!)
+service-account.json
+google-tasks-token.json
+
+# WhatsApp Web Session & Auth Cache
+.wwebjs_auth/
+.wwebjs_cache/
+
+# OS-specific files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Log files
+*.log
