@@ -7,6 +7,9 @@ node_modules/
 # Google API Credentials (extremely sensitive!)
 service-account.json
 google-tasks-token.json
+google-budget-token.json
+swiggy-mcp-auth/
+swiggy-orders.enc.json
 
 # WhatsApp Web Session & Auth Cache
 .wwebjs_auth/
@@ -19,3 +22,13 @@ Desktop.ini
 
 # Log files
 *.log
+
+# Generated stock reports
+reports/
+budget-reports/
+budget-data/
+__pycache__/
+*.py[cod]
+.agent-status.json
+.whatsapp-qr.png
+agent-error.log

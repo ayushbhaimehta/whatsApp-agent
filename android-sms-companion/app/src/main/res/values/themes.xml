@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.SmsBudgetCompanion" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#006C4C</item>
+        <item name="colorSecondary">#4E6358</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
+

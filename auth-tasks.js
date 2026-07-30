@@ -2,12 +2,13 @@ const { google } = require('googleapis');
 const http = require('http');
 const url = require('url');
 const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 require('dotenv').config();
 
-const PORT = 3000;
+const PORT = Number(process.env.GOOGLE_TASKS_OAUTH_PORT || 3000);
 const REDIRECT_URI = `http://localhost:${PORT}/oauth2callback`;
-const TOKEN_PATH = './google-tasks-token.json';
+const TOKEN_PATH = path.join(__dirname, 'google-tasks-token.json');
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -85,9 +86,6 @@ async function main() {
                 }
 
                 if (q.code) {
-                    res.writeHead(200, { 'Content-Type': 'text/html' });
-                    res.end('<h1>Authentication Successful!</h1><p>You can close this tab and return to the console.</p>');
-                    
                     console.log('\n📥 Authorization code received. Exchanging code for tokens...');
                     const { tokens } = await oauth2Client.getToken(q.code);
                     
@@ -98,6 +96,8 @@ async function main() {
                     };
 
                     fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokenData, null, 2), 'utf-8');
+                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                    res.end('<h1>Google Tasks connected</h1><p>You can close this tab. The WhatsApp agent will load the new token automatically.</p>');
                     console.log(`\n🎉 Success! Credentials & tokens saved to ${TOKEN_PATH}`);
                     console.log('✅ Google Tasks is now fully configured.\n');
                     
@@ -111,8 +111,11 @@ async function main() {
             }
         } catch (err) {
             console.error('❌ Error processing request:', err);
-            res.writeHead(500, { 'Content-Type': 'text/plain' });
-            res.end('Internal Server Error');
+            res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end('<h1>Google Tasks authorization failed</h1><p>Return to the agent console for details.</p>');
+            server.close();
+            rl.close();
+            process.exitCode = 1;
         }
     });
 

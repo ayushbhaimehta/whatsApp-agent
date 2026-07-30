@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">SMS Budget Companion</string>
+    <string name="title">SMS Budget Companion</string>
+    <string name="description">Uploads only locally detected, settled INR transaction SMS messages to your private budget endpoint.</string>
+    <string name="consent_disclosure">I consent to this app reading every inbox SMS from the current India-time month on each sync. Filtering happens on the phone, and only likely settled financial transactions with an INR amount are uploaded. OTP/authentication, promotions, balances, due notices, self-transfers, card-bill confirmations, order-status-only messages, and ordinary personal messages are excluded. Uploaded fields are a redacted sender, timestamp, and redacted SMS body. A count-only completion checkpoint proves the full monthly scan finished. Permission can be revoked in Android Settings.</string>
+    <string name="endpoint_hint">HTTPS upload endpoint</string>
+    <string name="secret_hint">Shared HMAC secret (leave blank to keep saved secret)</string>
+    <string name="save_configuration">Save secure configuration</string>
+    <string name="grant_sms_access">Grant SMS access</string>
+    <string name="sync_now">Sync current month now</string>
+    <string name="status_not_configured">Not configured</string>
+</resources>
