@@ -105,6 +105,7 @@ const {
 } = require('./message-policy');
 const { generateWithGeminiFallback } = require('./gemini-resilience');
 const { downloadVoiceMediaWithRetry } = require('./whatsapp-media');
+const { createWhatsAppReadinessWatchdog } = require('./whatsapp-readiness');
 bootStatus('loading_dotenv');
 bootStatus('initializing');
 
@@ -194,6 +195,41 @@ const client = new Client({
     authTimeoutMs: 300000,
     puppeteer: whatsappPuppeteerOptions
 });
+const configuredWhatsAppReadyTimeout = Number(process.env.WHATSAPP_READY_TIMEOUT_MS);
+const whatsappReadyTimeoutMs = Number.isFinite(configuredWhatsAppReadyTimeout)
+    && configuredWhatsAppReadyTimeout >= 30000
+    && configuredWhatsAppReadyTimeout <= 600000
+    ? configuredWhatsAppReadyTimeout
+    : 120000;
+const whatsappReadinessWatchdog = createWhatsAppReadinessWatchdog({
+    client,
+    isReady: () => clientIsReady,
+    stallTimeoutMs: whatsappReadyTimeoutMs,
+    onStalled: async details => {
+        const snapshot = details?.snapshot || {};
+        const diagnostic = {
+            elapsedSeconds: Math.round(Number(details?.elapsedMs || 0) / 1000),
+            socketState: snapshot.socketState || null,
+            hasSynced: Boolean(snapshot.hasSynced),
+            documentReadyState: snapshot.documentReadyState || null,
+            wwebjsInjected: Boolean(snapshot.wwebjsInjected)
+        };
+        console.error(
+            'WhatsApp authenticated but did not become ready before the safety timeout. ' +
+            `Restarting the browser process. Diagnostic: ${JSON.stringify(diagnostic)}`
+        );
+        writeAgentStatus('whatsapp_ready_timeout', diagnostic);
+        try {
+            await Promise.race([
+                client.destroy(),
+                new Promise(resolve => setTimeout(resolve, 1500))
+            ]);
+        } catch (error) {
+            console.warn('Could not close the stalled WhatsApp browser cleanly:', error.message || error);
+        }
+        process.exit(1);
+    }
+});
 
 // 5. Google API Setup
 const auth = new GoogleAuth({
@@ -279,10 +315,12 @@ client.on('qr', async (qr) => {
 client.on('authenticated', () => {
     console.log('✅ WhatsApp session authenticated. Waiting for chat synchronization...');
     writeAgentStatus('whatsapp_authenticated');
+    whatsappReadinessWatchdog.noteAuthenticated();
 });
 
 client.on('loading_screen', (percent, message) => {
     console.log(`⏳ WhatsApp loading: ${percent}%${message ? ` — ${message}` : ''}`);
+    whatsappReadinessWatchdog.noteLoading(percent, message);
 });
 
 client.on('change_state', state => {
@@ -292,6 +330,7 @@ client.on('change_state', state => {
 client.on('ready', async () => {
     if (clientIsReady) return;
     clientIsReady = true;
+    whatsappReadinessWatchdog.stop();
     try {
         fs.rmSync(WHATSAPP_QR_PATH, { force: true });
     } catch (error) {
@@ -358,6 +397,7 @@ client.on('auth_failure', message => {
 
 client.on('disconnected', reason => {
     clientIsReady = false;
+    whatsappReadinessWatchdog.stop();
     writeAgentStatus('disconnected', { reason: String(reason || 'Unknown') });
     console.error(`WhatsApp disconnected: ${String(reason || 'Unknown')}. Run npm start again to reconnect the agent.`);
     // A disconnected whatsapp-web.js client is not reliable to reuse. Exit the
@@ -1782,9 +1822,9 @@ async function initializeWhatsApp(attempt = 1) {
     try {
         await client.initialize();
         clearTimeout(waitingLog);
-        await recoverMissedReadyEvent();
     } catch (error) {
         clearTimeout(waitingLog);
+        whatsappReadinessWatchdog.reset();
         const message = error?.message || String(error);
         const transientNavigationError = /execution context|navigation|runtime\.callfunctionon|protocol error/i.test(message);
         console.error(`❌ WhatsApp initialization attempt ${attempt} failed:`, message);
@@ -1817,41 +1857,11 @@ async function initializeWhatsApp(attempt = 1) {
     }
 }
 
-async function recoverMissedReadyEvent() {
-    // whatsapp-web.js 1.34 can miss the Socket `change:hasSynced` event on a
-    // quick authenticated restart: WhatsApp finishes syncing before the
-    // library attaches its listener. In that state the web app is usable, but
-    // the Node client remains stuck at `starting` and receives no messages.
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    if (clientIsReady || !client.pupPage) return;
-
-    const syncState = await client.pupPage.evaluate(() => {
-        try {
-            const socket = window.require?.('WAWebSocketModel')?.Socket;
-            return {
-                state: socket?.state || null,
-                hasSynced: Boolean(socket?.hasSynced),
-                canTrigger: typeof window.onAppStateHasSyncedEvent === 'function'
-            };
-        } catch (error) {
-            return { state: null, hasSynced: false, canTrigger: false };
-        }
-    });
-
-    if (!syncState.hasSynced || !syncState.canTrigger) return;
-
-    console.warn(`WhatsApp was already synced (${syncState.state}); recovering its missed ready event.`);
-    await client.pupPage.evaluate(() => {
-        // Run after this evaluate call returns so the exposed callback can make
-        // its own Puppeteer calls without nesting inside the current call.
-        setTimeout(() => window.onAppStateHasSyncedEvent(), 0);
-    });
-}
-
 let shutdownStarted = false;
 async function shutdownAgent(signal) {
     if (shutdownStarted) return;
     shutdownStarted = true;
+    whatsappReadinessWatchdog.stop();
     writeAgentStatus('stopping', { signal });
     console.log(`Stopping WhatsApp agent (${signal})...`);
     for (const task of [stockSchedule, budgetSchedule, budgetCatchUpSchedule, swiggyOrderSyncSchedule]) {
