@@ -117,7 +117,10 @@ const {
 } = require('./message-policy');
 const { generateWithGeminiFallback } = require('./gemini-resilience');
 const { downloadVoiceMediaWithRetry } = require('./whatsapp-media');
-const { createWhatsAppReadinessWatchdog } = require('./whatsapp-readiness');
+const {
+    clearWhatsAppWebCache,
+    createWhatsAppReadinessWatchdog
+} = require('./whatsapp-readiness');
 bootStatus('loading_dotenv');
 bootStatus('initializing');
 
@@ -256,6 +259,15 @@ const whatsappReadinessWatchdog = createWhatsAppReadinessWatchdog({
             ]);
         } catch (error) {
             console.warn('Could not close the stalled WhatsApp browser cleanly:', error.message || error);
+        }
+        try {
+            clearWhatsAppWebCache(WHATSAPP_WEB_CACHE_PATH);
+            console.warn(
+                `Cleared the disposable WhatsApp Web cache at ${WHATSAPP_WEB_CACHE_PATH}. ` +
+                'The linked-device session was preserved; the next container attempt will load a fresh web client.'
+            );
+        } catch (error) {
+            console.warn('Could not clear the stalled WhatsApp Web cache:', error.message || error);
         }
         process.exit(1);
     }

@@ -1,12 +1,38 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+    clearWhatsAppWebCache,
     createWhatsAppReadinessWatchdog,
     inspectWhatsAppReadiness,
     normalizePercent
 } = require('../whatsapp-readiness');
 
 const quietLogger = { warn() {} };
+
+test('clears only the configured disposable WhatsApp web cache', () => {
+    const calls = [];
+    const cleared = clearWhatsAppWebCache('/data/whatsapp-web-cache', {
+        rmSync: (target, options) => calls.push(['remove', target, options]),
+        mkdirSync: (target, options) => calls.push(['create', target, options])
+    });
+
+    assert.equal(cleared, true);
+    assert.deepEqual(calls, [
+        ['remove', '/data/whatsapp-web-cache', { recursive: true, force: true }],
+        ['create', '/data/whatsapp-web-cache', { recursive: true }]
+    ]);
+});
+
+test('refuses to clear a cache when no exact path is configured', () => {
+    let touched = false;
+    const cleared = clearWhatsAppWebCache('  ', {
+        rmSync: () => { touched = true; },
+        mkdirSync: () => { touched = true; }
+    });
+
+    assert.equal(cleared, false);
+    assert.equal(touched, false);
+});
 
 test('normalizes WhatsApp loading percentages without accepting invalid values', () => {
     assert.equal(normalizePercent(100), 100);

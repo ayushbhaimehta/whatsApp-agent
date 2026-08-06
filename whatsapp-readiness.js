@@ -1,5 +1,20 @@
 'use strict';
 
+const fs = require('fs');
+
+/**
+ * Remove only whatsapp-web.js' disposable HTML/module cache. The linked-device
+ * credentials live in a different directory and must never be removed as part
+ * of readiness recovery.
+ */
+function clearWhatsAppWebCache(cachePath, { rmSync = fs.rmSync, mkdirSync = fs.mkdirSync } = {}) {
+    const normalizedPath = String(cachePath || '').trim();
+    if (!normalizedPath) return false;
+    rmSync(normalizedPath, { recursive: true, force: true });
+    mkdirSync(normalizedPath, { recursive: true });
+    return true;
+}
+
 /**
  * Read-only diagnostics for the period between WhatsApp authentication and the
  * real whatsapp-web.js `ready` event. Do not synthesize `ready`: doing so can
@@ -207,6 +222,7 @@ function createWhatsAppReadinessWatchdog({
 }
 
 module.exports = {
+    clearWhatsAppWebCache,
     createWhatsAppReadinessWatchdog,
     inspectWhatsAppReadiness,
     normalizePercent
