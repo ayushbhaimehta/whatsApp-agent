@@ -13,6 +13,9 @@ test('does not steal nutrition or ambiguous daily-report messages', () => {
     assert.equal(extractTickerRequest('daily report'), null);
     assert.equal(extractTickerRequest('give me a daily report'), null);
     assert.equal(extractTickerRequest('log 2 rotis'), null);
+    const budgetCorrection = "In this budget report I don't want ayush transfers amount added to final net spend";
+    assert.equal(extractTickerRequest(budgetCorrection), null);
+    assert.equal(parseStockReportRequest(budgetCorrection), null);
 });
 
 test('routes generic stock-report language to the complete configured batch', () => {

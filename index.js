@@ -546,7 +546,7 @@ client.on('message_create', async (msg) => {
         // Stock analysis is deliberately limited to your private self-chat. A
         // deterministic parser keeps normal food messages out of the long-running
         // report pipeline and accepts phrases such as "run analysis for AMD".
-        if (isPrivateChat && mimeType === "text/plain") {
+        if (isPrivateChat && mimeType === "text/plain" && !budgetRequestHint) {
             const shortcut = resolveTextShortcut({
                 text: inputData,
                 isPrivateChat,

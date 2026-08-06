@@ -103,6 +103,13 @@ test('deterministic text fallback is also personal-chat-only', () => {
     }
 });
 
+test('recognizes a post-report net-spend correction as budget context', () => {
+    assert.deepEqual(
+        parseMonthlyBudgetRequest("In this budget report I don't want ayush transfers amount added to final net spend"),
+        { action: 'monthly_budget', period: 'current_month' }
+    );
+});
+
 test('budget is not exposed through the general personal-only shortcut router', () => {
     const parseStockRequest = () => null;
     const extractTicker = () => null;

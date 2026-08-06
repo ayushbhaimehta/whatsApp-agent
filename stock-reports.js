@@ -18,7 +18,7 @@ const REQUEST_WORDS = /\b(?:reports?|analysis|analyse|analyze|valuations?|run|ge
 const STOCK_RESPONSE_HEADER = /\*(?:Stock report (?:status|ready|failed)|Scheduled stock reports?(?: ready| failed)?|Complete stock reports?(?: ready| failed)?)\b/i;
 const TICKER_STOP_WORDS = new Set([
     'A', 'ALL', 'AN', 'ANALYSIS', 'ANALYSE', 'ANALYZE', 'BATCH', 'COMPLETE', 'CREATE',
-    'DAILY', 'DAY', 'EQUITIES', 'EQUITY', 'FOR', 'FULL', 'GIVE', 'LIST', 'ME', 'MY',
+    'DAILY', 'DAY', 'EQUITIES', 'EQUITY', 'FOR', 'FULL', 'GIVE', 'I', 'LIST', 'ME', 'MY',
     'OF', 'ON', 'OVERALL', 'PLEASE', 'PORTFOLIO', 'REPORT', 'REPORTS', 'RUN', 'SHARE',
     'SHARES', 'SHOW', 'STOCK', 'STOCKS', 'THE', 'TICKER', 'TICKERS', 'TODAY', 'TODAYS',
     'COMPLETED', 'FAILED', 'HTML', 'OPEN', 'QUEUED', 'READY', 'STATUS', 'VALUATION', 'ZIP'
@@ -38,6 +38,8 @@ function extractTickerRequest(text) {
     }
 
     const hasExplicitStockNoun = /\b(?:stock|ticker|share|equity|valuation)\b/i.test(text);
+    const hasDifferentReportDomain = /\b(?:budget|expense|spending|payment|transaction|nutrition|macro|meal|food)\b/i.test(text);
+    if (hasDifferentReportDomain && !hasExplicitStockNoun) return null;
 
     const patterns = [
         /\b(?:report|analysis|analyse|analyze|valuation)\s+(?:of|for|on)?\s*\$?([A-Za-z^][A-Za-z0-9.\-=^]{0,14})\b/i,
@@ -76,10 +78,13 @@ function parseStockReportRequest(text) {
         return null;
     }
 
+    const hasExplicitStockNoun = /\b(?:stocks?|tickers?|shares?|equities|equity|valuation)\b/i.test(text);
+    const hasDifferentReportDomain = /\b(?:budget|expense|spending|payment|transaction|nutrition|macro|meal|food)\b/i.test(text);
+    if (hasDifferentReportDomain && !hasExplicitStockNoun) return null;
+
     const ticker = extractTickerRequest(text);
     if (ticker) return { scope: 'ticker', ticker };
 
-    const hasExplicitStockNoun = /\b(?:stocks?|tickers?|shares?|equities|equity|valuation)\b/i.test(text);
     if (hasExplicitStockNoun) return { scope: 'all', ticker: null };
     return null;
 }

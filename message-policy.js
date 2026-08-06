@@ -62,6 +62,7 @@ function parseMonthlyBudgetRequest(text) {
     const moneyTerms = '(?:budget|spend(?:ing)?|spent|expenses?|payments?|transactions?|money)';
     const monthTerms = '(?:monthly|this\\s+month|current\\s+month|for\\s+the\\s+month|mahine|maheene)';
     const looksLikeBudgetRequest = new RegExp(`\\b${monthTerms}\\b.{0,45}\\b${moneyTerms}\\b|\\b${moneyTerms}\\b.{0,45}\\b${monthTerms}\\b`, 'i').test(normalized) ||
+        /\bbudget\s+(?:report|summary|breakdown)\b/.test(normalized) ||
         /\b(?:payment|spending|expense|transaction)\s+(?:breakdown|summary|report)\b/.test(normalized) ||
         /\bwhere\s+did\s+(?:all\s+)?my\s+money\s+go\b/.test(normalized) ||
         /\bis\s+mahine\s+ka\s+(?:budget|kharcha)\b/.test(normalized);
