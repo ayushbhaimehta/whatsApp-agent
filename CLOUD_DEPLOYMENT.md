@@ -69,10 +69,11 @@ Set-Location "C:\Users\ayush\OneDrive\Desktop\whatsapp-food-agent"
 git status
 git diff --check
 npm test
+npm run test:stock
 npm audit --omit=dev
 ```
 
-The expected result is 110 passing tests and `found 0 vulnerabilities`. In `git status`, `deleted: budget_2026-07.html` is expected: the private report still exists locally and is ignored, but the next commit removes it from Git tracking.
+The expected result is that every Node and Python test passes and `found 0 vulnerabilities`. In `git status`, `deleted: budget_2026-07.html` is expected: the private report still exists locally and is ignored, but the next commit removes it from Git tracking.
 
 Confirm that none of these appears as a tracked/staged file:
 
@@ -89,7 +90,7 @@ Stage the already tracked source updates plus the new, known-safe deployment fil
 
 ```powershell
 git add -u
-git add .dockerignore .env.cloud.example AWS_FREE_DEPLOYMENT.md CLOUD_DEPLOYMENT.md Dockerfile budget-access-policy.js cloud-check.js compose.yaml runtime-paths.js test/budget-chat-guardrails.test.js test/runtime-paths.test.js
+git add .dockerignore .env.cloud.example AWS_FREE_DEPLOYMENT.md CLOUD_DEPLOYMENT.md Dockerfile budget-access-policy.js cloud-check.js compose.yaml runtime-paths.js stock_intelligence.py test/budget-chat-guardrails.test.js test/budget-category-rules.test.js test/runtime-paths.test.js test/test_stock_intelligence.py
 git status
 git diff --cached --check
 git diff --cached --name-only

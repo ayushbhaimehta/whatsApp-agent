@@ -86,7 +86,7 @@ function runCloudPreflight({ logger = console } = {}) {
     const python = String(process.env.PYTHON_EXECUTABLE || (process.platform === 'win32' ? 'python' : 'python3')).trim();
     const pythonCheck = commandResult(python, [
         '-c',
-        'import google.genai, pandas, requests, yfinance; print("Python stock dependencies are ready")'
+        'import google.genai, pandas, requests, yfinance, stock_intelligence; print("Python stock dependencies are ready")'
     ]);
     if (!pythonCheck.error && pythonCheck.status === 0) {
         add('ok', 'Python stock engine dependencies are importable', python);

@@ -13,10 +13,13 @@ const {
     identifyMerchant,
     classifyMerchantNameFallback,
     classifyItem,
+    normalizeBudgetCategoryRuleProposals,
+    buildBudgetRuleMerchantMatchPrompt,
     createTransaction,
     reconcileTransactions,
     buildSmsMerchantEvidence,
     isSmsMerchantClassificationCandidate,
+    projectSmsMerchantForGemini,
     buildMerchantCategoryPrompt,
     buildBudgetEnrichmentPrompt,
     applySmsMerchantClassification,
@@ -343,6 +346,7 @@ test('sends only a hashed id and extracted SMS merchant name to Gemini', () => {
         text: 'HDFCBK INR 1,234.50 spent at ACME KITCHENS on 29/Jul/2026 at 10:30 PM card XX1234. Avl Bal Rs.9,000.',
         sourceType: 'sms'
     });
+    transaction.smsPrivacyValidated = true;
     const evidence = buildSmsMerchantEvidence(transaction);
     assert.match(evidence, /ACME KITCHENS/i);
     assert.doesNotMatch(evidence, /1,234\.50|29\/Jul\/2026|10:30|XX1234|9,000/i);
@@ -352,6 +356,17 @@ test('sends only a hashed id and extracted SMS merchant name to Gemini', () => {
     assert.deepEqual(records, [{ id: transaction.id, merchant: evidence }]);
     assert.deepEqual(Object.keys(records[0]), ['id', 'merchant']);
 
+    const projection = projectSmsMerchantForGemini(transaction);
+    assert.deepEqual(projection, { id: transaction.id, merchant: evidence });
+    assert.deepEqual(Object.keys(projection), ['id', 'merchant']);
+    for (const forbidden of [
+        'sourceExcerpt', 'sender', 'amountPaise', 'occurredAt', 'provider',
+        'sourceType', 'merchantRaw', 'sources', 'sourceIds', 'direction', 'currency'
+    ]) {
+        assert.equal(Object.hasOwn(projection, forbidden), false, `${forbidden} must not cross the Gemini boundary`);
+    }
+    assert.equal(buildMerchantCategoryPrompt([projection]), prompt);
+
     const embeddedIdentifiers = {
         ...transaction,
         merchant: 'John Doe 9876543210 john.doe@okhdfc'
@@ -359,6 +374,7 @@ test('sends only a hashed id and extracted SMS merchant name to Gemini', () => {
     assert.equal(buildSmsMerchantEvidence(embeddedIdentifiers), 'John Doe');
     assert.doesNotMatch(buildMerchantCategoryPrompt([embeddedIdentifiers]), /9876543210|john\.doe@okhdfc/i);
     assert.equal(buildSmsMerchantEvidence({ ...transaction, merchant: 'john.doe@okhdfc' }), '');
+    assert.equal(projectSmsMerchantForGemini({ ...transaction, id: 'external-raw-id' }), null);
 });
 
 test('sends a transfer counterparty name but no transaction details to Gemini', () => {
@@ -369,6 +385,7 @@ test('sends a transfer counterparty name but no transaction details to Gemini', 
         text: 'HDFCBK Sent Rs.500 From HDFC Bank A/C XX123 To JOHN DOE On 29/Jul/2026.',
         sourceType: 'sms'
     });
+    transfer.smsPrivacyValidated = true;
     const prompt = buildBudgetEnrichmentPrompt([transfer]);
     assert.match(prompt, /John Doe/);
     assert.doesNotMatch(prompt, /Rs\.500|HDFCBK|XX123|29\/Jul\/2026|From HDFC|Personal transfer/i);
@@ -384,6 +401,7 @@ test('Gemini merchant classification changes only the SMS category', () => {
         text: 'HDFCBK Sent Rs.500 From HDFC Bank A/C XX123 To GREEN LEAF CORNER On 11/Jul/2026.',
         sourceType: 'sms'
     });
+    transaction.smsPrivacyValidated = true;
     transaction.items = [{ name: 'sentinel', category: 'other', lineAmountPaise: null }];
     assert.equal(isSmsMerchantClassificationCandidate(transaction), true);
     const before = structuredClone(transaction);
@@ -412,6 +430,8 @@ test('Gemini maps people to Transfers and opaque names to Miscellaneous safely',
         provider: 'android_sms', externalId: 'opaque-ai', occurredAt: '2026-07-11T13:00:00Z',
         text: 'INR 500 paid to ARLIGA ECOWORLD BUSINESS via UPI.', sourceType: 'sms'
     });
+    person.smsPrivacyValidated = true;
+    opaque.smsPrivacyValidated = true;
     const results = applySmsMerchantClassification([person, opaque], {
         transactions: [
             { id: person.id, entity_type: 'person', channel_category: 'shopping', confidence: 0.96 },
@@ -454,6 +474,7 @@ test('rejects low-confidence, duplicate-id, malformed, and unknown-merchant clas
         provider: 'android_sms', externalId: 'classification-validation', occurredAt: '2026-07-11T12:00:00Z',
         text: 'INR 500 paid to GREEN LEAF CORNER via UPI.', sourceType: 'sms'
     });
+    transaction.smsPrivacyValidated = true;
     const lowConfidence = applySmsMerchantClassification([transaction], {
         transactions: [{ id: transaction.id, entity_type: 'business', channel_category: 'misc_food', confidence: 0.74 }]
     })[0];
@@ -667,6 +688,157 @@ test('reads encrypted Android financial SMS records for the selected month', () 
     }
 });
 
+test('merges historical copies of one SMS accepted under different companion installations', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-sms-cross-install-'));
+    const storePath = path.join(directory, 'sms.enc.jsonl');
+    const secret = 'historical-cross-install-secret-at-least-32-characters';
+    const records = [
+        {
+            id: 'legacy-device-one-id',
+            occurredAt: '2026-08-04T10:15:00.000Z',
+            sender: 'AX-HDFCBK',
+            body: 'INR 500 debited at ZEPTO'
+        },
+        {
+            id: 'legacy-device-two-id',
+            occurredAt: '2026-08-04T10:15:00.000Z',
+            sender: 'AX-HDFCBK',
+            body: 'INR 500 debited at ZEPTO'
+        }
+    ];
+    fs.writeFileSync(
+        storePath,
+        `${records.map(record => JSON.stringify(encryptStoredSmsRecord(record, secret))).join('\n')}\n`,
+        'utf8'
+    );
+    try {
+        const collected = collectAndroidSmsTransactions({
+            storePath,
+            storeSecret: secret,
+            window: getMonthWindow('2026-08')
+        });
+        const reconciled = reconcileTransactions(collected.transactions);
+        assert.equal(collected.transactions.length, 2, 'source aliases stay available for Google Sheets reconciliation');
+        assert.equal(reconciled.length, 1);
+        assert.equal(reconciled[0].duplicateCount, 1);
+        assert.deepEqual(reconciled[0].duplicateReasons, ['repeated_companion_sync']);
+        assert.equal(reconciled[0].sourceIds.length, 2);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('revalidates encrypted historical SMS before budget parsing or Gemini eligibility', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-sms-privacy-'));
+    const storePath = path.join(directory, 'sms.enc.jsonl');
+    const secret = 'privacy-boundary-test-secret-that-is-long-enough';
+    const records = [
+        { id: 'valid', occurredAt: '2026-07-14T10:00:00.000Z', sender: 'HDFCBK', body: 'INR 450 paid at GREEN LEAF CAFE' },
+        { id: 'personal', occurredAt: '2026-07-14T10:01:00.000Z', sender: '[phone]', body: 'I paid INR 450 for dinner' },
+        { id: 'otp', occurredAt: '2026-07-14T10:02:00.000Z', sender: 'HDFCBK', body: 'OTP 123456 for transaction of INR 450' },
+        { id: 'promo', occurredAt: '2026-07-14T10:03:00.000Z', sender: 'ZEPTON', body: 'Get INR 450 cashback when you shop now' },
+        { id: 'balance', occurredAt: '2026-07-14T10:04:00.000Z', sender: 'HDFCBK', body: 'Available balance is INR 45,000' },
+        { id: 'statement', occurredAt: '2026-07-14T10:05:00.000Z', sender: 'HDFCCB', body: 'Statement generated. Amount due INR 450' }
+    ];
+    fs.writeFileSync(
+        storePath,
+        `${records.map(record => JSON.stringify(encryptStoredSmsRecord(record, secret))).join('\n')}\n`,
+        'utf8'
+    );
+    try {
+        const result = collectAndroidSmsTransactions({
+            storePath,
+            storeSecret: secret,
+            window: getMonthWindow('2026-07')
+        });
+        assert.equal(result.transactions.length, 1);
+        assert.equal(result.transactions[0].merchant, 'Green Leaf Cafe');
+        assert.match(result.warnings.join(' '), /Ignored 5 stored SMS record\(s\).*privacy validation/i);
+        assert.deepEqual(projectSmsMerchantForGemini(result.transactions[0]), {
+            id: result.transactions[0].id,
+            merchant: 'Green Leaf Cafe'
+        });
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('end-to-end SMS budget path exposes only sanitized merchant projections to every Gemini hook', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-sms-llm-boundary-'));
+    const storePath = path.join(directory, 'sms.enc.jsonl');
+    const outputDirectory = path.join(directory, 'reports');
+    const secret = 'end-to-end-privacy-secret-that-is-long-enough';
+    const privateTokens = [
+        'HDFCBK', '1,234.50', '9876', '29/Jul/2026', '10:30', 'N123456789',
+        'I paid INR 888 for dinner', '+919999999999'
+    ];
+    const records = [
+        {
+            id: 'valid-private-source',
+            occurredAt: '2026-07-14T10:00:00.000Z',
+            sender: 'HDFCBK',
+            body: 'INR 1,234.50 paid to SECRET CAFE 9876 via UPI on 29/Jul/2026 at 10:30; UTR N123456789.'
+        },
+        {
+            id: 'personal-source',
+            occurredAt: '2026-07-14T10:01:00.000Z',
+            sender: '+919999999999',
+            body: 'I paid INR 888 for dinner, send me your half.'
+        }
+    ];
+    fs.writeFileSync(
+        storePath,
+        `${records.map(record => JSON.stringify(encryptStoredSmsRecord(record, secret))).join('\n')}\n`,
+        'utf8'
+    );
+    const merchantClassifierCalls = [];
+    const categoryMatcherCalls = [];
+    const categoryRules = normalizeBudgetCategoryRuleProposals([{
+        category_label: 'Eating Out',
+        merchant_types: ['food_business']
+    }]);
+    try {
+        const result = await generateMonthlyBudgetReport({
+            period: '2026-07',
+            now: new Date('2026-07-30T08:00:00.000Z'),
+            requireCompleteSmsScan: false,
+            smsStorePath: storePath,
+            smsStoreSecret: secret,
+            outputDirectory,
+            categoryRules,
+            classifyBatch: async (batch, mode) => {
+                assert.equal(mode, 'sms_merchant');
+                merchantClassifierCalls.push(structuredClone(batch));
+                assert.deepEqual(batch, [{ id: batch[0].id, merchant: 'Secret Cafe' }]);
+                const prompt = buildMerchantCategoryPrompt(batch);
+                for (const token of privateTokens) assert.doesNotMatch(prompt, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+                return {
+                    transactions: [{
+                        id: batch[0].id,
+                        entity_type: 'business',
+                        channel_category: 'misc_food',
+                        confidence: 0.99
+                    }]
+                };
+            },
+            matchCategoryRules: async (batch, rules) => {
+                categoryMatcherCalls.push(structuredClone(batch));
+                assert.deepEqual(batch, [{ id: batch[0].id, merchant: 'Secret Cafe' }]);
+                const prompt = buildBudgetRuleMerchantMatchPrompt(batch, rules);
+                for (const token of privateTokens) assert.doesNotMatch(prompt, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+                return { matches: [{ id: batch[0].id, rule_ids: [rules[0].id] }] };
+            }
+        });
+        assert.equal(merchantClassifierCalls.length, 1);
+        assert.equal(categoryMatcherCalls.length, 1);
+        assert.equal(result.report.transactions.length, 1, 'the personal SMS must not enter the report pipeline');
+        assert.equal(result.report.transactions[0].merchant, 'Secret Cafe 9876');
+        assert.match(result.report.transactions[0].channelCategory, /^custom_eating_out_/);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
 test('reports an encrypted SMS store whose secret is unavailable', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-sms-'));
     const storePath = path.join(directory, 'sms.enc.jsonl');
@@ -873,6 +1045,8 @@ test('classifies each unresolved SMS merchant once and propagates the category',
             smsScanStatePath: scanStatePath,
             outputDirectory,
             classifyBatch: async (batch, mode) => {
+                assert.ok(batch.every(record => JSON.stringify(Object.keys(record)) === JSON.stringify(['id', 'merchant'])));
+                assert.ok(batch.every(record => /^[a-f0-9]{24}$/.test(record.id)));
                 classificationCalls.push({ mode, merchants: batch.map(transaction => transaction.merchant) });
                 assert.equal(mode, 'sms_merchant');
                 return {

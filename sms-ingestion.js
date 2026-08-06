@@ -10,18 +10,54 @@ const DEFAULT_SCAN_FRESHNESS_MS = 12 * 60 * 60 * 1000;
 const MAX_MESSAGES_PER_REQUEST = 100;
 const IST_OFFSET_MS = 330 * 60 * 1000;
 
-function isLikelyTransactionSms(body) {
+const INR_AMOUNT_PATTERN = /(?:₹\s*|INR\s*|Rs\.?\s*)[0-9][0-9,]*(?:\.\d{1,2})?|[0-9][0-9,]*(?:\.\d{1,2})?\s*(?:INR|rupees?)\b/i;
+const AUTHENTICATION_SECRET_PATTERN = /(?:\b(?:otp|one[ -]?time(?:\s+password)?|verification\s+code|security\s+code|login\s+code|authentication\s+code|sign[ -]?in\s+code)\b\s*(?:is|:|-)?\s*\d{3,8}\b)|(?:\b\d{3,8}\b\s*(?:is|:|-)?\s*(?:your\s+)?(?:otp|one[ -]?time\s+password|verification\s+code|security\s+code|login\s+code)\b)|(?:\b(?:use|enter|share|provide)\s+(?:the\s+)?(?:otp|code\s+)?\d{3,8}\b)|(?:\b(?:otp|verification\s+code|security\s+code)\b[\s\S]{0,30}\b(?:is|:)\s*\d{3,8}\b)/i;
+const SETTLED_TRANSACTION_PATTERN = /\b(?:debited|spent|paid|charged|purchased|refunded|refund|reversal|withdrawn|transferred)\b/i;
+const EXPLICIT_SENT_TRANSFER_PATTERN = /\bsent\b[\s\S]{0,160}\bfrom\b[\s\S]{0,160}\bto\b/i;
+const COMPLETED_PAYMENT_PATTERN = /(?:\b(?:payment|transaction|txn|upi)\b[\s\S]{0,80}\b(?:successful|succeeded|completed)\b)|(?:\b(?:successful|succeeded|completed)\b[\s\S]{0,80}\b(?:payment|transaction|txn|upi)\b)/i;
+const NON_SETTLED_TRANSACTION_PATTERN = /(?:\b(?:payment|transaction|txn|upi|order|mandate|autopay)\b[\s\S]{0,50}\b(?:failed|declined|cancelled|canceled|unsuccessful|pending|processing|scheduled|requested|request)\b)|(?:\b(?:failed|declined|cancelled|canceled|unsuccessful|pending|processing|scheduled|requested|request)\b[\s\S]{0,50}\b(?:payment|transaction|txn|upi|order|mandate|autopay)\b)|(?:\b(?:please|kindly)\s+(?:pay|send|transfer)\b)|(?:\b(?:pay|send|transfer)\s+now\b)/i;
+const PERSONAL_CONVERSATION_PATTERN = /(?:\b(?:i|we)\s+(?:paid|spent|sent|transferred|charged)\b)|(?:\b(?:can|could|would)\s+you\s+(?:pay|send|transfer)\b)|(?:\b(?:send\s+me|your\s+half|split\s+(?:it|this|the\s+bill)|you\s+owe|i\s+owe)\b)/i;
+const PHONE_LIKE_SENDER_PATTERN = /^\+?[\d\s().-]{7,20}$/;
+
+function hasSettledTransactionEvidence(body) {
     const text = String(body || '');
-    if (/\b(?:otp|one[ -]?time password|verification code|login code)\b/i.test(text)) return false;
+    return INR_AMOUNT_PATTERN.test(text) &&
+        (SETTLED_TRANSACTION_PATTERN.test(text) ||
+            COMPLETED_PAYMENT_PATTERN.test(text) ||
+            EXPLICIT_SENT_TRANSFER_PATTERN.test(text));
+}
+
+function isPersonalSmsSender(sender) {
+    const value = String(sender || '').trim();
+    // Fail closed when sender provenance is unavailable. Normal bank and UPI
+    // alerts use an alphanumeric sender ID; a blank sender cannot safely be
+    // distinguished from a personal SMS.
+    if (!value) return true;
+    if (/^(?:\[phone\]|unknown|null|private|anonymous)$/i.test(value)) return true;
+    if (PHONE_LIKE_SENDER_PATTERN.test(value)) return true;
+    const digits = value.replace(/\D/g, '');
+    return digits.length >= 10 && digits.length / value.length >= 0.65;
+}
+
+function isLikelyTransactionSms(body, sender = '') {
+    const text = String(body || '').trim();
+    if (!text || isPersonalSmsSender(sender)) return false;
+    if (AUTHENTICATION_SECRET_PATTERN.test(text)) return false;
+    if (PERSONAL_CONVERSATION_PATTERN.test(text)) return false;
+    if (NON_SETTLED_TRANSACTION_PATTERN.test(text) && !/\brefund(?:ed)?\b/i.test(text)) return false;
     if (/\b(?:statement generated|minimum amount due|payment due|bill due|due date)\b/i.test(text)) return false;
     if (/\b(?:between your accounts?|to (?:your )?(?:own account|self))\b/i.test(text)) return false;
     if (/\bcredit card\b[\s\S]{0,50}\bpayment\b[\s\S]{0,30}\b(?:received|successful)\b/i.test(text)) return false;
-    const hasAmount = /(?:₹\s*|INR\s*|Rs\.?\s*)[0-9][0-9,]*(?:\.\d{1,2})?/i.test(text) || /[0-9][0-9,]*(?:\.\d{1,2})?\s*(?:INR|rupees?)\b/i.test(text);
-    const hasSettledTransaction = /\b(?:debited|spent|paid|charged|purchase[sd]?|refund(?:ed)?|reversal|withdrawn|transferred)\b/i.test(text);
+    const hasSettledTransaction = hasSettledTransactionEvidence(text);
     if (/\b(?:available|avl|current|closing)\s+(?:a\/?c\s+)?bal(?:ance)?\b/i.test(text) && !hasSettledTransaction) return false;
-    if (/\b(?:offer|sale|discount|deal|apply now|pre-approved|win|earn|cashback)\b/i.test(text) && !hasSettledTransaction) return false;
-    const hasTransactionLanguage = hasSettledTransaction || /\b(?:payment|txn|transaction|upi)\b/i.test(text);
-    return hasAmount && hasTransactionLanguage;
+    const hasPromotionLanguage = /\b(?:offer|sale|discount|deal|shop now|limited time|apply now|pre-approved|win|earn|cashback)\b/i.test(text);
+    if (hasPromotionLanguage && !hasSettledTransaction) return false;
+    const hasClearEventDespitePromotion = /\b(?:debited|spent|charged|purchased|refunded|refund|reversal|withdrawn|transferred|paid\s+(?:to|at|for))\b/i.test(text) ||
+        COMPLETED_PAYMENT_PATTERN.test(text);
+    if (hasPromotionLanguage && !hasClearEventDespitePromotion) return false;
+    // Generic words such as "payment", "UPI", or "transaction" are not
+    // enough: only a completed INR debit/refund can cross this boundary.
+    return hasSettledTransaction;
 }
 
 function sanitizeSmsBody(body) {
@@ -36,6 +72,16 @@ function sanitizeSmsBody(body) {
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 2000);
+}
+
+function minimizeTransactionSmsBody(body) {
+    return sanitizeSmsBody(body)
+        .replace(/(?:[.;]\s*)?\b(?:available|avl|current|closing)\s+(?:a\/?c\s+)?bal(?:ance)?\b[\s\S]*$/i, '')
+        .replace(/(?:[.;]\s*)?\b(?:if\s+(?:this\s+was\s+)?not\s+you|not\s+you\??|report\s+(?:this|fraud)|call\s+(?:the\s+)?bank|never\s+share\s+(?:your\s+)?(?:otp|pin|cvv))\b[\s\S]*$/i, '')
+        .replace(/(?:[.;]\s*)?\b(?:get|earn|claim|enjoy)\b[\s\S]{0,80}\b(?:cashback|offer|discount|reward)\b[\s\S]*$/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 750);
 }
 
 function computeSignature(secret, timestamp, nonce, rawBody) {
@@ -206,34 +252,60 @@ function verifySignedRequest({ secret, timestamp, nonce, signature, rawBody, now
     return safeEqual(expected, signature);
 }
 
-function loadKnownIds(storePath, secret) {
+function computeSmsTransactionFingerprint({ sender, occurredAt, occurred_at: occurredAtSnake, timestamp, body } = {}) {
+    const normalizedOccurredAt = new Date(occurredAt || occurredAtSnake || timestamp);
+    if (!Number.isFinite(normalizedOccurredAt.getTime())) return null;
+    const normalizedSender = String(sender || 'Unknown')
+        .trim()
+        .replace(/[^A-Za-z0-9+_-]/g, '')
+        .slice(0, 40)
+        .toUpperCase() || 'UNKNOWN';
+    const normalizedBody = minimizeTransactionSmsBody(body);
+    if (!normalizedBody) return null;
+    return crypto.createHash('sha256')
+        .update(`sms-transaction-v1\0${normalizedSender}\0${normalizedOccurredAt.toISOString()}\0${normalizedBody}`)
+        .digest('hex');
+}
+
+function loadKnownRecords(storePath, secret) {
     const ids = new Set();
-    if (!fs.existsSync(storePath)) return ids;
+    const fingerprints = new Set();
+    if (!fs.existsSync(storePath)) return { ids, fingerprints };
     for (const line of fs.readFileSync(storePath, 'utf8').split(/\r?\n/)) {
         if (!line) continue;
         try {
             const record = decryptStoredSmsRecord(JSON.parse(line), secret);
             if (record.id) ids.add(record.id);
+            const fingerprint = record.fingerprint || computeSmsTransactionFingerprint(record);
+            if (fingerprint) fingerprints.add(fingerprint);
         } catch (_) {
             // Malformed historical lines are ignored and surfaced by the report reader.
         }
     }
-    return ids;
+    return { ids, fingerprints };
 }
 
 function normalizeIncomingSms(message, deviceId) {
-    const body = sanitizeSmsBody(message?.body);
-    if (!isLikelyTransactionSms(body)) return null;
+    const rawSender = String(message?.sender || 'Unknown').trim();
+    if (!isLikelyTransactionSms(message?.body, rawSender)) return null;
+    const body = minimizeTransactionSmsBody(message?.body);
+    if (!body || !isLikelyTransactionSms(body, rawSender)) return null;
     const occurredAt = new Date(message?.occurred_at || message?.occurredAt || message?.timestamp);
     if (!Number.isFinite(occurredAt.getTime())) return null;
-    const sender = String(message?.sender || 'Unknown').replace(/[^A-Za-z0-9+_-]/g, '').slice(0, 40);
-    const externalId = String(message?.id || `${sender}|${occurredAt.toISOString()}|${body}`);
+    const sender = rawSender.replace(/[^A-Za-z0-9+_-]/g, '').slice(0, 40) || 'Unknown';
+    const fingerprint = computeSmsTransactionFingerprint({ sender, occurredAt, body });
+    if (!fingerprint) return null;
     return {
-        id: crypto.createHash('sha256').update(`${deviceId}|${externalId}`).digest('hex').slice(0, 32),
+        // The companion's device ID changes after a reinstall. Identity must be
+        // based on the immutable alert itself so a full-month rescan cannot add
+        // the same transaction a second time under a new installation ID.
+        id: fingerprint.slice(0, 32),
+        fingerprint,
         occurredAt: occurredAt.toISOString(),
         sender,
         body,
-        receivedAt: new Date().toISOString()
+        receivedAt: new Date().toISOString(),
+        privacyVersion: 2
     };
 }
 
@@ -263,7 +335,7 @@ function createSmsIngestionServer({
 
     const absoluteStorePath = path.resolve(storePath);
     fs.mkdirSync(path.dirname(absoluteStorePath), { recursive: true });
-    const knownIds = loadKnownIds(absoluteStorePath, secret);
+    const knownRecords = loadKnownRecords(absoluteStorePath, secret);
     const recentNonces = new Map();
 
     const handler = (request, response) => {
@@ -346,11 +418,12 @@ function createSmsIngestionServer({
                     filtered += 1;
                     continue;
                 }
-                if (knownIds.has(record.id)) {
+                if (knownRecords.ids.has(record.id) || knownRecords.fingerprints.has(record.fingerprint)) {
                     duplicateIds.push(record.id);
                     continue;
                 }
-                knownIds.add(record.id);
+                knownRecords.ids.add(record.id);
+                knownRecords.fingerprints.add(record.fingerprint);
                 accepted.push(record);
             }
             if (accepted.length > 0) {
@@ -406,7 +479,10 @@ module.exports = {
     MAX_MESSAGES_PER_REQUEST,
     DEFAULT_SCAN_FRESHNESS_MS,
     isLikelyTransactionSms,
+    hasSettledTransactionEvidence,
+    isPersonalSmsSender,
     sanitizeSmsBody,
+    minimizeTransactionSmsBody,
     computeSignature,
     encryptStoredSmsRecord,
     decryptStoredSmsRecord,
@@ -415,6 +491,7 @@ module.exports = {
     recordCompleteSmsScan,
     getCompleteSmsScanCoverage,
     verifySignedRequest,
+    computeSmsTransactionFingerprint,
     normalizeIncomingSms,
     createSmsIngestionServer
 };

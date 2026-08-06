@@ -7,9 +7,13 @@ const path = require('path');
 const {
     MAX_MESSAGES_PER_REQUEST,
     isLikelyTransactionSms,
+    isPersonalSmsSender,
     sanitizeSmsBody,
+    minimizeTransactionSmsBody,
     computeSignature,
+    computeSmsTransactionFingerprint,
     verifySignedRequest,
+    normalizeIncomingSms,
     createSmsIngestionServer,
     decryptStoredSmsRecord,
     getCompleteSmsScanCoverage
@@ -59,17 +63,103 @@ function postJson({ address, secret, value, contentType = 'application/json', ti
 
 test('filters OTP and personal/promotional messages on the server as defense in depth', () => {
     assert.equal(isLikelyTransactionSms('OTP 123456 for transaction of INR 500'), false);
+    assert.equal(isLikelyTransactionSms('Your OTP for an INR 500 transaction is 123456'), false);
     assert.equal(isLikelyTransactionSms('Get cashback of INR 500 when you shop today'), false);
-    assert.equal(isLikelyTransactionSms('INR 500 debited from A/c XX1234 at ZEPTO'), true);
+    assert.equal(isLikelyTransactionSms('INR 500 debited from A/c XX1234 at ZEPTO', 'AX-HDFCBK'), true);
+    assert.equal(isLikelyTransactionSms('UPI payment of INR 500 to Fresh Foods was successful', 'VM-ICICI'), true);
     assert.equal(isLikelyTransactionSms('hello, are we meeting today?'), false);
+    assert.equal(isLikelyTransactionSms('Please pay INR 500 to the electricity account'), false);
+    assert.equal(isLikelyTransactionSms('UPI collect request for INR 500 is pending'), false);
     assert.equal(isLikelyTransactionSms('Available balance is INR 50,000 in your account'), false);
+    assert.equal(isLikelyTransactionSms('Statement generated for INR 50,000'), false);
     assert.equal(isLikelyTransactionSms('Credit card bill payment of INR 5,000 was received successfully'), false);
     assert.equal(isLikelyTransactionSms('INR 5,000 transferred to your own account'), false);
+    assert.equal(isLikelyTransactionSms('I paid INR 500 for dinner', '+91 98765 43210'), false);
+    assert.equal(isLikelyTransactionSms('I paid INR 500 for dinner', '[phone]'), false);
+    assert.equal(isLikelyTransactionSms('INR 500 debited at ZEPTO', ''), false);
+    assert.equal(isLikelyTransactionSms('INR 500 debited at ZEPTO', 'Unknown'), false);
+    assert.equal(isLikelyTransactionSms('I paid INR 500 for dinner, send me your half', 'FRIEND'), false);
+    assert.equal(isLikelyTransactionSms('We sent INR 500 cashback for being a valued customer', 'PAYAPP'), false);
+    assert.equal(isLikelyTransactionSms('We paid INR 500 cashback to selected customers', 'PAYAPP'), false);
+    assert.equal(isPersonalSmsSender('+91 98765 43210'), true);
+    assert.equal(isPersonalSmsSender('[phone]'), true);
+    assert.equal(isPersonalSmsSender('AX-HDFCBK'), false);
 });
 
 test('redacts secrets and long references before storage', () => {
     const sanitized = sanitizeSmsBody('OTP is 123456. Ref 1234 5678 9012. Paid INR 10 to ayush.name@okaxis, phone +91 98765 43210.');
     assert.doesNotMatch(sanitized, /123456|1234 5678 9012|ayush\.name@okaxis|98765 43210/);
+});
+
+test('minimizes accepted transaction text before encrypted storage', () => {
+    const minimized = minimizeTransactionSmsBody(
+        'INR 500 debited at ZEPTO using card XX123456. Avl Bal INR 50,000. ' +
+        'Never share your OTP. Get cashback on your next order.'
+    );
+    assert.match(minimized, /INR 500 debited at ZEPTO/i);
+    assert.doesNotMatch(minimized, /XX123456|50,000|OTP|cashback/i);
+    assert.ok(minimized.length <= 750);
+
+    const record = normalizeIncomingSms({
+        id: 'tail-test',
+        occurred_at: '2026-07-20T10:00:00Z',
+        sender: 'AX-HDFCBK',
+        body: 'INR 500 debited at ZEPTO. Avl Bal INR 50,000. Never share your OTP.'
+    }, 'test-device');
+    assert.ok(record, 'a settled bank alert must survive minimization and revalidation');
+    assert.equal(record.body, 'INR 500 debited at ZEPTO');
+});
+
+test('uses the same stable SMS identity after a companion reinstall', () => {
+    const message = {
+        id: 'android-row-42',
+        occurred_at: '2026-08-04T10:15:00.000Z',
+        sender: 'AX-HDFCBK',
+        body: 'INR 500 debited at ZEPTO. Avl Bal INR 50,000.'
+    };
+    const firstInstall = normalizeIncomingSms(message, 'device-before-reinstall');
+    const secondInstall = normalizeIncomingSms(message, 'device-after-reinstall');
+    assert.ok(firstInstall);
+    assert.equal(firstInstall.id, secondInstall.id);
+    assert.equal(firstInstall.fingerprint, secondInstall.fingerprint);
+    assert.equal(firstInstall.fingerprint, computeSmsTransactionFingerprint(firstInstall));
+});
+
+test('rejects a previously stored SMS when it is resent by another companion installation', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sms-cross-install-'));
+    const storePath = path.join(directory, 'store.jsonl');
+    const secret = 'cross-install-dedupe-secret-at-least-32-characters';
+    const message = {
+        id: 'row-7',
+        occurred_at: '2026-08-04T10:15:00.000Z',
+        sender: 'AX-HDFCBK',
+        body: 'INR 500 debited at ZEPTO'
+    };
+    let service = createSmsIngestionServer({ secret, storePath, host: '127.0.0.1', port: 0 });
+    try {
+        let address = await service.listen();
+        const first = await postJson({
+            address,
+            secret,
+            value: { deviceId: 'first-install', messages: [message] }
+        });
+        assert.equal(first.body.accepted, 1);
+        await service.close();
+
+        service = createSmsIngestionServer({ secret, storePath, host: '127.0.0.1', port: 0 });
+        address = await service.listen();
+        const repeated = await postJson({
+            address,
+            secret,
+            value: { deviceId: 'second-install', messages: [message] }
+        });
+        assert.equal(repeated.body.accepted, 0);
+        assert.equal(repeated.body.duplicates, 1);
+        assert.equal(fs.readFileSync(storePath, 'utf8').trim().split(/\r?\n/).length, 1);
+    } finally {
+        await service.close().catch(() => undefined);
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
 });
 
 test('verifies timestamped HMAC requests and rejects stale timestamps', () => {
@@ -116,7 +206,13 @@ test('legacy v1 ingestion encrypts candidates but does not satisfy full-scan cov
         device_id: 'test-device',
         messages: [
             { id: '1', occurred_at: '2026-07-20T10:00:00Z', sender: 'HDFCBK', body: 'INR 500 debited at ZEPTO' },
-            { id: '2', occurred_at: '2026-07-20T10:01:00Z', sender: 'FRIEND', body: 'See you at 5' }
+            { id: '2', occurred_at: '2026-07-20T10:01:00Z', sender: 'FRIEND', body: 'See you at 5' },
+            { id: '3', occurred_at: '2026-07-20T10:02:00Z', sender: '+919876543210', body: 'I paid INR 500 for dinner' },
+            { id: '4', occurred_at: '2026-07-20T10:03:00Z', sender: 'HDFCBK', body: 'OTP 123456 for transaction of INR 500' },
+            { id: '5', occurred_at: '2026-07-20T10:04:00Z', sender: 'ZEPTON', body: 'Get INR 500 cashback when you shop now' },
+            { id: '6', occurred_at: '2026-07-20T10:05:00Z', sender: 'HDFCBK', body: 'Available balance is INR 50,000' },
+            { id: '7', occurred_at: '2026-07-20T10:06:00Z', sender: 'HDFCCB', body: 'Statement generated. Minimum amount due INR 500' },
+            { id: '8', occurred_at: '2026-07-20T10:07:00Z', sender: '[phone]', body: 'I paid INR 500 for dinner' }
         ]
     }));
     const timestamp = Date.now();
@@ -147,10 +243,12 @@ test('legacy v1 ingestion encrypts candidates but does not satisfy full-scan cov
     try {
         assert.equal(response.status, 200);
         assert.equal(response.body.accepted, 1);
-        assert.equal(response.body.filtered, 1);
+        assert.equal(response.body.filtered, 7);
         const envelope = JSON.parse(fs.readFileSync(storePath, 'utf8').trim());
         assert.equal(envelope.v, 1);
-        assert.equal(decryptStoredSmsRecord(envelope, secret).body, 'INR 500 debited at ZEPTO');
+        const stored = decryptStoredSmsRecord(envelope, secret);
+        assert.equal(stored.body, 'INR 500 debited at ZEPTO');
+        assert.equal(stored.privacyVersion, 2);
         assert.doesNotMatch(fs.readFileSync(storePath, 'utf8'), /ZEPTO/);
         assert.deepEqual(
             getCompleteSmsScanCoverage({

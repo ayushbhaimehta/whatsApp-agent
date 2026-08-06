@@ -15,15 +15,23 @@ object TransactionSmsFilter {
         RegexOption.IGNORE_CASE,
     )
     private val settledTransactionRegex = Regex(
-        """\b(debited|spent|paid|charged|purchases?|purchased|refunded|refund|reversal|withdrawn|transferred)\b""",
+        """\b(debited|spent|paid|charged|purchased|refunded|refund|reversal|withdrawn|transferred)\b""",
         RegexOption.IGNORE_CASE,
     )
-    private val transactionLanguageRegex = Regex(
-        """\b(payment|txn|transaction|upi)\b""",
+    private val explicitSentTransferRegex = Regex(
+        """\bsent\b.{0,160}\bfrom\b.{0,160}\bto\b""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
+    private val completedPaymentRegex = Regex(
+        """(?:\b(payment|txn|transaction|upi)\b.{0,80}\b(successful|succeeded|completed)\b)|(?:\b(successful|succeeded|completed)\b.{0,80}\b(payment|txn|transaction|upi)\b)""",
         RegexOption.IGNORE_CASE,
     )
     private val failedOrPendingRegex = Regex(
-        """\b(payment|transaction|txn|order)\b.{0,30}\b(failed|declined|cancelled|canceled|unsuccessful|pending|processing)\b|\b(failed|declined|cancelled|canceled|pending)\b.{0,30}\b(payment|transaction|txn|order)\b""",
+        """\b(payment|transaction|txn|upi|order|mandate|autopay)\b.{0,50}\b(failed|declined|cancelled|canceled|unsuccessful|pending|processing|scheduled|requested|request)\b|\b(failed|declined|cancelled|canceled|unsuccessful|pending|processing|scheduled|requested|request)\b.{0,50}\b(payment|transaction|txn|upi|order|mandate|autopay)\b|\b(please|kindly)\s+(pay|send|transfer)\b|\b(pay|send|transfer)\s+now\b""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val personalConversationRegex = Regex(
+        """(?:\b(i|we)\s+(paid|spent|sent|transferred|charged)\b)|(?:\b(can|could|would)\s+you\s+(pay|send|transfer)\b)|(?:\b(send\s+me|your\s+half|split\s+(it|this|the\s+bill)|you\s+owe|i\s+owe)\b)""",
         RegexOption.IGNORE_CASE,
     )
     private val dueNoticeRegex = Regex(
@@ -44,6 +52,10 @@ object TransactionSmsFilter {
     )
     private val promotionRegex = Regex(
         """\b(offer|coupon|promo\s*code|discount|sale|deal|shop\s+now|limited\s+time|flat\s+\d+%?\s+off|save\s+up\s+to|apply\s+now|pre[\s-]?approved|win|earn|cashback)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val clearEventDespitePromotionRegex = Regex(
+        """\b(debited|spent|charged|purchased|refunded|refund|reversal|withdrawn|transferred|paid\s+(to|at|for))\b""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -71,12 +83,26 @@ object TransactionSmsFilter {
     private val phoneRegex = Regex("""(?<!\d)\+?\d(?:[\s-]?\d){9,14}(?!\d)""")
     private val longNumberRegex = Regex("""(?<!\d)(?:\d[\s-]?){8,}(?!\d)""")
     private val whitespaceRegex = Regex("""\s+""")
+    private val phoneLikeSenderRegex = Regex("""^\+?[\d\s().-]{7,20}$""")
+    private val balanceTailRegex = Regex(
+        """(?:[.;]\s*)?\b(?:available|avl|current|closing)\s+(?:a/?c\s+)?bal(?:ance)?\b.*$""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
+    private val securityTailRegex = Regex(
+        """(?:[.;]\s*)?\b(?:if\s+(?:this\s+was\s+)?not\s+you|not\s+you\??|report\s+(?:this|fraud)|call\s+(?:the\s+)?bank|never\s+share\s+(?:your\s+)?(?:otp|pin|cvv))\b.*$""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
+    private val marketingTailRegex = Regex(
+        """(?:[.;]\s*)?\b(?:get|earn|claim|enjoy)\b.{0,80}\b(?:cashback|offer|discount|reward)\b.*$""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
 
-    @Suppress("UNUSED_PARAMETER")
     fun isTransactionCandidate(sender: String?, body: String): Boolean {
         val text = body.trim()
         if (text.isEmpty()) return false
+        if (isPersonalSender(sender)) return false
         if (authenticationCodeRegex.containsMatchIn(text)) return false
+        if (personalConversationRegex.containsMatchIn(text)) return false
         if (failedOrPendingRegex.containsMatchIn(text) && !text.contains("refund", ignoreCase = true)) {
             return false
         }
@@ -87,14 +113,27 @@ object TransactionSmsFilter {
         // Order statuses and vague transaction notices cannot contribute a reliable budget amount.
         if (!inrAmountRegex.containsMatchIn(text)) return false
 
-        val hasSettledTransaction = settledTransactionRegex.containsMatchIn(text)
+        val hasSettledTransaction = settledTransactionRegex.containsMatchIn(text) ||
+            completedPaymentRegex.containsMatchIn(text) ||
+            explicitSentTransferRegex.containsMatchIn(text)
         if (balanceOnlyRegex.containsMatchIn(text) && !hasSettledTransaction) return false
         if (promotionRegex.containsMatchIn(text) && !hasSettledTransaction) return false
+        if (promotionRegex.containsMatchIn(text) &&
+            !clearEventDespitePromotionRegex.containsMatchIn(text) &&
+            !completedPaymentRegex.containsMatchIn(text)
+        ) return false
 
-        return hasSettledTransaction || transactionLanguageRegex.containsMatchIn(text)
+        // Generic "payment", "UPI", or "transaction" wording is deliberately
+        // insufficient. Only a completed INR debit/refund leaves the device.
+        return hasSettledTransaction
     }
 
-    fun toTransactionSms(record: SmsRecord): TransactionSms {
+    fun toTransactionSms(record: SmsRecord): TransactionSms? {
+        if (!isTransactionCandidate(record.sender, record.body)) return null
+        val minimizedBody = minimizeTransactionBody(record.body).take(MAX_BODY_LENGTH)
+        // Defense in depth on-device: removal of a balance/security/marketing
+        // tail must not leave a non-transaction fragment eligible for upload.
+        if (!isTransactionCandidate(record.sender, minimizedBody)) return null
         val stableMaterial = listOf(
             record.sender,
             record.receivedAtMillis.toString(),
@@ -107,7 +146,7 @@ object TransactionSmsFilter {
             id = digest,
             sender = sanitizeSender(record.sender),
             receivedAtMillis = record.receivedAtMillis,
-            body = sanitizeBody(record.body).take(MAX_BODY_LENGTH),
+            body = minimizedBody,
         )
     }
 
@@ -130,7 +169,26 @@ object TransactionSmsFilter {
         .replace(whitespaceRegex, " ")
         .trim()
 
-    private const val MAX_BODY_LENGTH = 2_000
+    internal fun minimizeTransactionBody(body: String): String = sanitizeBody(body)
+        .replace(balanceTailRegex, "")
+        .replace(securityTailRegex, "")
+        .replace(marketingTailRegex, "")
+        .replace(whitespaceRegex, " ")
+        .trim()
+
+    private fun isPersonalSender(sender: String?): Boolean {
+        val value = sender?.trim().orEmpty()
+        if (value.isEmpty()) return true
+        if (value.equals("[phone]", ignoreCase = true) ||
+            value.equals("unknown", ignoreCase = true) ||
+            value.equals("private", ignoreCase = true) ||
+            value.equals("anonymous", ignoreCase = true)
+        ) return true
+        if (phoneLikeSenderRegex.matches(value)) return true
+        val digitCount = value.count(Char::isDigit)
+        return digitCount >= 10 && digitCount.toDouble() / value.length >= 0.65
+    }
+
+    private const val MAX_BODY_LENGTH = 750
     private const val MAX_SENDER_LENGTH = 40
 }
-

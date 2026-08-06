@@ -80,6 +80,7 @@ These are natural-language examples, not rigid magic words. Similar wording shou
 | Report one stock | **Personal only** | **Text only** | `Stock report for AMD` | The Python engine generates and attaches one HTML report. |
 | Report all configured stocks | **Personal only** | **Text only** | `Stock report of the day` | Every ticker in `TICKER_INPUT` is processed; a ZIP or the HTML reports are attached. |
 | Current monthly budget | **Personal only** | Both | `Budget for the month` | A WhatsApp summary and HTML report are returned after SMS coverage is verified. |
+| Create or change a budget category | **Personal only** | Text | `Put restaurant and food-stall merchants under Eating Out in this month's budget` | The constrained rule is saved for that month and the existing report is regenerated, or the next report uses it. |
 
 ### Food logging rules
 
@@ -129,6 +130,10 @@ give all stock reports
 budget for the month
 where did my money go this month?
 is mahine ka kharcha batao
+
+budget for this month and put restaurant merchants under Eating Out
+categorize Bottle Lab under Office Cafe in this month's budget
+clear my custom budget categories for this month
 ```
 
 Macro summaries, meal suggestions, stock reports, and budgets are intentionally ignored in the cook chat. Food logging and shopping tasks work in both configured chats. When a food or shopping command comes from the cook chat, its confirmation is sent privately to `PERSONAL_CHAT_ID`.
@@ -145,6 +150,7 @@ If `PERSONAL_CHAT_ID` is missing, invalid, or identifies the same direct chat as
 - Stock reports from the cook chat.
 - Budgets from a WhatsApp Payments chat. There is no Payments chat integration; WhatsApp is only the command and delivery channel.
 - Direct Zomato, Zepto, Ownly, or BigBasket order-history scraping. Their payment merchants can still be categorized from SMS, and Gmail receipts may provide item details.
+- Bypassing a news paywall, login, robots restriction, or provider rate limit. Stock sentiment uses accessible public headline/feed metadata and optional authorized APIs; a Bloomberg or Investing.com headline can receive a high source-quality score when it is visible through a public feed, but the agent does not break into the article body.
 - Cash spending that never appears in SMS, Gmail, or another configured source.
 
 ---
@@ -180,13 +186,16 @@ flowchart LR
 | Google Sheets | Storing food rows and structured budget rows. |
 | Google Tasks | Storing shopping reminders. |
 | Python/Yahoo market data | Core market data, valuation, technical calculations, and HTML stock reports. |
+| Public market-evidence feeds | Relevant headline metadata, source-weighted sentiment, corroboration, and current-year analyst-target evidence without paywall bypass. |
 | Android SMS companion | Supplying filtered, redacted transaction alerts for the monthly budget. |
 | Gmail, optional | Read-only receipt lookup for item-level budget enrichment. |
 | Swiggy, optional | Read-only Food/Instamart order details matched to an existing payment. |
 
 Gemini does **not** control budget amounts. SMS/receipt parsing, incoming-credit removal, refund handling, and duplicate reconciliation are deterministic. Gemini may classify an extracted merchant name or explicitly visible receipt item, but it cannot alter the amount, direction, or total.
 
-For stocks, Gemini Search adds optional analyst-source enrichment. If that quota is unavailable, Yahoo market data, valuation calculations, technical analysis, fallback analyst data, and HTML generation continue. The report remains usable, but the analyst-enrichment section may be less current or less complete.
+For stocks, Gemini Search is only one analyst-source adapter. Yahoo headline metadata and public RSS/JSON feeds now provide a separate crawler path. Relevant evidence is scored using publisher quality, an optional reviewed author reputation, company/ticker relevance, freshness, independent corroboration, and noise penalties; near-duplicate headlines do not receive extra votes. That evidence is combined with trend, moving averages, 3/6/12-month momentum, and RSI to produce a separate `STRONG SELL` / `SELL` / `HOLD` / `BUY` / `STRONG BUY` market-sentiment signal with confidence and coverage. Individual analyst actions must be dated in the current calendar year and include a public source URL; missing targets remain `N/A` rather than being guessed. The current rolling Yahoo consensus is labelled separately from those YTD action rows.
+
+Gemini quota failure therefore no longer removes all analyst discovery: public-feed target headlines can still be extracted conservatively. Core market data, valuation, technical analysis, HTML generation, and the deterministic sentiment fallback remain independent of Gemini. Thin or unavailable public evidence is shown as a low-confidence technical-only fallback, not as false precision.
 
 ---
 
@@ -259,9 +268,10 @@ npm ci
 py -3 -m pip install --upgrade pip
 py -3 -m pip install -r .\requirements.txt
 npm test
+npm run test:stock
 ```
 
-Do not continue until the test summary says there are zero failures. The current suite contains 89 tests and does not send real WhatsApp messages.
+Do not continue until both test commands report zero failures. They use mocks/fixtures and do not send real WhatsApp messages or fetch live market feeds.
 
 ### 4. Create the local configuration file
 
@@ -479,7 +489,19 @@ Optional stock settings:
 FMP_API_KEY=
 STOCK_REPORT_TIMEOUT_MINUTES=180
 REPORT_PUBLIC_BASE_URL=
+MARKET_SENTIMENT_LOOKBACK_DAYS=120
+MARKET_REDDIT_ENABLED=true
+MARKET_GDELT_ENABLED=true
+# Optional reviewed author/analyst reputation, from 0.0 to 1.0. Do not assign
+# a high score merely because an account is popular.
+MARKET_AUTHOR_REPUTATION_JSON={"exact analyst or handle":0.90}
+# Optional official X API bearer token. Leave blank to skip X completely.
+MARKET_X_BEARER_TOKEN=
 ```
+
+`MARKET_REDDIT_ENABLED=false` disables the low-weight public Reddit RSS adapter, and `MARKET_GDELT_ENABLED=false` disables GDELT. X is queried only through its official recent-search API when `MARKET_X_BEARER_TOKEN` is configured; there is no hidden Twitter/X login or page scraping. Social authors receive a meaningful boost only when the feed identifies the author and that exact author is present in your reviewed `MARKET_AUTHOR_REPUTATION_JSON`; otherwise social posts stay low weight. Publisher weights and every accepted headline's final weight are visible in the HTML report.
+
+The auditable evidence metric is `(30% publisher quality + 10% reviewed author score + 25% ticker/company relevance + 15% freshness + 20% independent corroboration) × (1 − noise penalty)`. Near-duplicate headlines are reduced to one voting item. With at least three well-covered items, news supplies 68% of the combined signal and technicals 32%; thin evidence uses 50/50, and no qualifying news produces an explicitly low-confidence technical-only result. To give a specific analyst such as Serenity additional social-source weight, add only the exact feed handle after you have reviewed its track record, for example `MARKET_AUTHOR_REPUTATION_JSON={"@serenity":0.90}`. The agent never assumes that popularity equals accuracy.
 
 Without `REPORT_PUBLIC_BASE_URL`, WhatsApp sends the HTML or ZIP as a document attachment. That is the normal setup; public web hosting is not required.
 
@@ -491,7 +513,16 @@ The monthly budget requires a recent, complete scan of the current month's trans
 
 ### What leaves the phone?
 
-The companion scans the current India-time month in memory. It excludes ordinary conversations, OTPs, promotions, pending/failed payments, balance notices, due notices, self-transfers, and order-status-only messages. It redacts phone numbers, account/card details, UPI IDs, and transaction references before upload.
+The companion scans the current India-time month in memory. It excludes ordinary conversations, messages from blank/unknown/ordinary phone-number senders, OTPs, promotions, pending/failed payments, balance notices, due notices, self-transfers, and order-status-only messages. A message must contain an INR amount **and** evidence of a completed debit, payment, purchase, withdrawal, transfer, or refund; vague text that merely says “transaction” or “UPI” is not enough. It redacts phone numbers, account/card details, UPI IDs, and transaction references before upload.
+
+There are four independent privacy boundaries:
+
+1. **On the phone:** non-transaction SMS is rejected before the network client is called.
+2. **At ingestion:** the Node service repeats the strict filter, schema checks, HMAC verification, timestamp check, and replay protection. It then encrypts accepted records with AES-256-GCM before writing them to disk.
+3. **In the budget parser:** amounts, direction, refunds, duplicates, and totals are calculated locally. Gemini is not allowed to edit those fields.
+4. **At the Gemini boundary:** an unresolved SMS contributes only a random-looking hashed row ID and the already-extracted, sanitized merchant candidate. The SMS body, sender, amount, timestamp, account/card data, UPI ID, and payment reference are not included in that prompt.
+
+This protects what is transmitted and sent to Gemini, but Android still has to grant the companion `READ_SMS` so it can perform the local filtering. If you do not accept that device permission boundary, disable SMS ingestion and revoke/uninstall the companion; a complete SMS-based budget cannot then be produced.
 
 ### 1. Enable the desktop SMS receiver
 
@@ -830,6 +861,7 @@ Run these from the repository root:
 |---|---|
 | `npm start` | Start the entire agent. This is the only long-running command. |
 | `npm test` | Run the mocked/unit test suite without sending WhatsApp messages. |
+| `npm run test:stock` | Run the offline Python stock-intelligence tests without live web calls. |
 | `npm run auth:tasks` | First-time Google Tasks connection or `invalid_grant` recovery. |
 | `npm run auth:budget` | Optional read-only Gmail receipt authorization. |
 | `npm run auth:swiggy` | First-time or expired Swiggy Food/Instamart authorization. |
@@ -996,6 +1028,19 @@ Budget for the month
 
 A payment SMS usually contains only the merchant and total. The agent does not guess items or divide a total. Connect Gmail receipts and Swiggy order history when available; other merchant categories can still work without itemization.
 
+### Custom monthly budget categories
+
+From `PERSONAL_CHAT_ID` only, you can add a rule while requesting a report or correct an already-generated report:
+
+```text
+Budget for this month; put restaurants and food stalls under Eating Out
+Categorize Bottle Lab as Office Cafe in this month's budget
+Move existing Misc food transactions into Eating Out for August 2026
+Clear my custom budget categories for this month
+```
+
+Rules are scoped to the requested month and saved in private runtime storage. A rule may match exact sanitized merchant names, an existing built-in category, or one of a bounded set of merchant types such as restaurant/food business, grocery, transport, health, utility, or person transfer. Gemini converts the request to that constrained schema and, when semantic matching is needed, sees only hashed merchant IDs and sanitized merchant names. It never receives an SMS body, sender, amount, timestamp, account/card field, UPI ID, or payment reference for this operation. Category rules can change grouping and labels only; they cannot change amounts, refund direction, deduplication, or monthly totals.
+
 ### Python is not found
 
 ```powershell
@@ -1021,6 +1066,7 @@ If that fails, install Python. If Python exists somewhere unusual, set its full 
 | SMS scan checkpoints | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\android-sms-scan-state.json` / `cloud-data/budget-data/android-sms-scan-state.json` | Latest 24 device/month checkpoints. |
 | Budget HTML/JSON | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-reports\` / `cloud-data/budget-reports/` | One pair per month; no automatic deletion. |
 | Swiggy normalized order cache | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\` / `cloud-data/budget-data/` | Encrypted; automatically pruned to 90 days. |
+| Monthly custom category rules | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\category-rules.json` / `cloud-data/budget-data/category-rules.json` | Private file, scoped by month; until cleared/deleted. |
 | Swiggy OAuth state | `%LOCALAPPDATA%\WhatsAppFoodAgent\secrets\swiggy-mcp-auth\` / `cloud-data/secrets/swiggy-mcp-auth/` | Until expired/replaced/deleted. |
 | Stock reports | `reports\` / `cloud-data/stock-reports/` | Until manually deleted. |
 | WhatsApp audit log | `chat-events.log` / `cloud-data/logs/chat-events.log` | Append-only; no automatic rotation currently. |
@@ -1072,6 +1118,7 @@ If a secret was ever committed or placed in a shared URL/log, removing the text 
 ## First-run checklist
 
 - [ ] `npm test` finishes with zero failures.
+- [ ] `npm run test:stock` finishes with zero failures.
 - [ ] `.env` contains the Gemini key, Sheet ID, and Google credentials.
 - [ ] `Sheet1!A1:H1` contains the required headers.
 - [ ] The Sheet is shared with the service-account email as Editor.

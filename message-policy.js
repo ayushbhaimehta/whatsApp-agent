@@ -58,16 +58,21 @@ function parseMonthlyBudgetRequest(text) {
     if (!normalized) return null;
     if (/\b(?:budget|cheap|inexpensive|low[- ]cost)\s+(?:meal|food|lunch|dinner|breakfast|recipe)\b/.test(normalized)) return null;
 
+    const categoryRuleRequest = looksLikeBudgetCategoryRuleRequest(normalized);
     const moneyTerms = '(?:budget|spend(?:ing)?|spent|expenses?|payments?|transactions?|money)';
     const monthTerms = '(?:monthly|this\\s+month|current\\s+month|for\\s+the\\s+month|mahine|maheene)';
     const looksLikeBudgetRequest = new RegExp(`\\b${monthTerms}\\b.{0,45}\\b${moneyTerms}\\b|\\b${moneyTerms}\\b.{0,45}\\b${monthTerms}\\b`, 'i').test(normalized) ||
         /\b(?:payment|spending|expense|transaction)\s+(?:breakdown|summary|report)\b/.test(normalized) ||
         /\bwhere\s+did\s+(?:all\s+)?my\s+money\s+go\b/.test(normalized) ||
         /\bis\s+mahine\s+ka\s+(?:budget|kharcha)\b/.test(normalized);
-    if (!looksLikeBudgetRequest) return null;
+    if (!looksLikeBudgetRequest && !categoryRuleRequest) return null;
 
     const isoPeriod = normalized.match(/\b(20\d{2})[-/](0?[1-9]|1[0-2])\b/);
-    if (isoPeriod) return { action: 'monthly_budget', period: `${isoPeriod[1]}-${isoPeriod[2].padStart(2, '0')}` };
+    if (isoPeriod) return {
+        action: 'monthly_budget',
+        period: `${isoPeriod[1]}-${isoPeriod[2].padStart(2, '0')}`,
+        ...(categoryRuleRequest ? { requiresRuleInterpretation: true } : {})
+    };
 
     const monthNames = {
         january: '01', february: '02', march: '03', april: '04', may: '05', june: '06',
@@ -75,9 +80,41 @@ function parseMonthlyBudgetRequest(text) {
     };
     for (const [name, month] of Object.entries(monthNames)) {
         const match = normalized.match(new RegExp(`\\b${name}\\b.{0,12}\\b(20\\d{2})\\b|\\b(20\\d{2})\\b.{0,12}\\b${name}\\b`));
-        if (match) return { action: 'monthly_budget', period: `${match[1] || match[2]}-${month}` };
+        if (match) return {
+            action: 'monthly_budget',
+            period: `${match[1] || match[2]}-${month}`,
+            ...(categoryRuleRequest ? { requiresRuleInterpretation: true } : {})
+        };
     }
-    return { action: 'monthly_budget', period: 'current_month' };
+    return {
+        action: 'monthly_budget',
+        period: 'current_month',
+        ...(categoryRuleRequest ? { requiresRuleInterpretation: true } : {})
+    };
+}
+
+function looksLikeBudgetCategoryRuleRequest(text) {
+    const normalized = String(text || '').trim().toLowerCase();
+    if (!normalized) return false;
+    const categoryLanguage = /\b(?:categor(?:y|ies|ise|ize|ised|ized|isation|ization)|classif(?:y|ied|ication)|group|move|put|bucket|recategor(?:ise|ize)|rename|label|mark|treat|call|create)\b/;
+    const financialObject = /\b(?:budget|report|transactions?|payments?|expenses?|spending|merchants?|category|categories)\b/;
+    const reportChange = /\b(?:regenerate|rebuild|redo|update|change)\b.{0,55}\b(?:budget|report|category|categories)\b|\b(?:budget|report|category|categories)\b.{0,55}\b(?:regenerate|rebuild|redo|update|change)\b/;
+    const explicitCategoryMapping = /\b(?:categor(?:ise|ize)|classif(?:y|ied)|recategor(?:ise|ize))\b.{1,100}\b(?:as|under|into)\b/.test(normalized) ||
+        /\b(?:move|put|group)\b.{0,45}\b(?:merchants?|restaurants?|cafes?|payments?|transactions?|transfers?)\b.{0,60}\b(?:under|into|as)\b/.test(normalized);
+    const inlineBudgetAssignment = financialObject.test(normalized) &&
+        /\b(?:all|every|these|those)\b.{0,80}\b(?:should|must)\s+(?:be|go)\b.{0,35}\b(?:in|into|under|to|as)\b/.test(normalized);
+    return (categoryLanguage.test(normalized) && financialObject.test(normalized)) || reportChange.test(normalized) || explicitCategoryMapping || inlineBudgetAssignment;
+}
+
+function resolveBudgetCategoryOperation(text, proposedOperation) {
+    const normalized = String(text || '').trim().toLowerCase();
+    const proposed = String(proposedOperation || '').trim().toLowerCase();
+    const explicitClear = /\breset\b.{0,60}\b(?:custom\s+)?(?:budget\s+)?(?:categories|category\s+rules?|rules?)\b/.test(normalized) ||
+        /\b(?:clear|delete|remove)\b.{0,30}\ball\b.{0,45}\b(?:custom\s+)?(?:budget\s+)?(?:categories|category\s+rules?|rules?)\b/.test(normalized);
+    const explicitReplace = /\b(?:replace|overwrite)\b.{0,35}\b(?:all|existing|previous|old)\b.{0,45}\b(?:custom\s+)?(?:budget\s+)?(?:categories|category\s+rules?|rules?)\b/.test(normalized);
+    if (proposed === 'clear' && explicitClear) return 'clear';
+    if (proposed === 'replace' && explicitReplace) return 'replace';
+    return 'merge';
 }
 
 function resolveTextShortcut({ text, isPrivateChat, parseStockRequest, extractTicker, getDefaultMealType }) {
@@ -101,7 +138,7 @@ function resolveTextShortcut({ text, isPrivateChat, parseStockRequest, extractTi
     return null;
 }
 
-function resolveGeminiAction({ result, isCookChat, isPrivateChat, canAccessBudget = false }) {
+function resolveGeminiAction({ result, isCookChat, isPrivateChat, canAccessBudget = false, budgetInstructionText = '' }) {
     if (!isCookChat && !isPrivateChat) return { action: 'ignore' };
     const intent = result?.intent || 'none';
     if (intent === 'log_food' && Array.isArray(result.items) && result.items.length > 0) {
@@ -119,9 +156,16 @@ function resolveGeminiAction({ result, isCookChat, isPrivateChat, canAccessBudge
         return { action: isPrivateChat ? 'summarize_day' : 'ignore' };
     }
     if (intent === 'monthly_budget') {
-        return canAccessBudget
-            ? { action: 'monthly_budget', period: result.period || 'current_month' }
-            : { action: 'ignore' };
+        if (!canAccessBudget) return { action: 'ignore' };
+        const action = { action: 'monthly_budget', period: result.period || 'current_month' };
+        if (Array.isArray(result.budget_category_rules) && result.budget_category_rules.length > 0) {
+            action.budgetCategoryRules = result.budget_category_rules;
+        }
+        const operation = resolveBudgetCategoryOperation(budgetInstructionText, result.budget_category_operation);
+        if (operation !== 'merge') {
+            action.budgetCategoryOperation = operation;
+        }
+        return action;
     }
     return { action: 'ignore' };
 }
@@ -136,6 +180,8 @@ module.exports = {
     isDailyNutritionSummaryRequest,
     parseMealSuggestionRequest,
     parseMonthlyBudgetRequest,
+    looksLikeBudgetCategoryRuleRequest,
+    resolveBudgetCategoryOperation,
     resolveTextShortcut,
     resolveGeminiAction
 };

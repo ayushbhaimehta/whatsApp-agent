@@ -23,6 +23,7 @@ services:
       SMS_TRANSACTION_STORE: /data/budget-data/android-sms.enc.jsonl
       SMS_SCAN_STATE_PATH: /data/budget-data/android-sms-scan-state.json
       BUDGET_SCHEDULE_STATE_PATH: /data/budget-data/monthly-schedule-state.json
+      BUDGET_CATEGORY_RULES_PATH: /data/budget-data/category-rules.json
       BUDGET_REPORTS_DIR: /data/budget-reports
       SWIGGY_MCP_AUTH_DIR: /data/secrets/swiggy-mcp-auth
       SWIGGY_ORDER_CACHE_PATH: /data/budget-data/swiggy-orders.enc.json

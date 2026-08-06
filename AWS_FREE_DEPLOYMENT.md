@@ -29,18 +29,19 @@ Confirm the GitHub repository displays the **Private** badge. Then run in **Wind
 ```powershell
 Set-Location "C:\Users\ayush\OneDrive\Desktop\whatsapp-food-agent"
 npm test
+npm run test:stock
 npm audit --omit=dev
 git diff --check
 git status
 ```
 
-Expect 110 passing tests and `found 0 vulnerabilities`. `budget_2026-07.html` being deleted from Git is expected; its ignored local copy remains on Windows.
+Expect every Node and Python test to pass and `found 0 vulnerabilities`. `budget_2026-07.html` being deleted from Git is expected; its ignored local copy remains on Windows.
 
 Stage only the known files:
 
 ```powershell
 git add -u
-git add .dockerignore .env.cloud.example AWS_FREE_DEPLOYMENT.md CLOUD_DEPLOYMENT.md Dockerfile budget-access-policy.js cloud-check.js compose.yaml runtime-paths.js test/budget-chat-guardrails.test.js test/runtime-paths.test.js
+git add .dockerignore .env.cloud.example AWS_FREE_DEPLOYMENT.md CLOUD_DEPLOYMENT.md Dockerfile budget-access-policy.js cloud-check.js compose.yaml runtime-paths.js stock_intelligence.py test/budget-chat-guardrails.test.js test/budget-category-rules.test.js test/runtime-paths.test.js test/test_stock_intelligence.py
 git diff --cached --check
 git diff --cached --name-only
 git status
@@ -402,10 +403,11 @@ Run in **AWS Ubuntu**:
 cd ~/whatsApp-agent
 docker compose build
 docker compose run --rm agent npm test
+docker compose run --rm agent npm run test:stock
 docker compose run --rm agent npm run cloud:check
 ```
 
-The build can take 10–30 minutes on a burstable 2 GiB VM. Do not interrupt it. Expect 110 passing tests and `Cloud preflight passed`; optional Gmail/Swiggy warnings are acceptable until authorization.
+The build can take 10–30 minutes on a burstable 2 GiB VM. Do not interrupt it. Expect every Node and Python test to pass and `Cloud preflight passed`; optional Gmail/Swiggy warnings are acceptable until authorization.
 
 If only the SMS secret is missing:
 

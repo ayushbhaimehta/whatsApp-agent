@@ -94,6 +94,18 @@ class TransactionSmsFilterTest {
                 "Limited time offer: get Rs.500 off on Zepto. Shop now!",
             ),
         )
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "PAYAPP",
+                "We sent INR 500 cashback because you are a valued customer.",
+            ),
+        )
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "PAYAPP",
+                "We paid INR 500 cashback to selected customers.",
+            ),
+        )
     }
 
     @Test
@@ -108,6 +120,22 @@ class TransactionSmsFilterTest {
             TransactionSmsFilter.isTransactionCandidate(
                 "AXISBK",
                 "Your UPI payment of INR 650 is pending.",
+            ),
+        )
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "AXISBK",
+                "UPI collect request for INR 650 awaits your approval.",
+            ),
+        )
+    }
+
+    @Test
+    fun `rejects generic payment wording without a settled event`() {
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "PAYAPP",
+                "Please pay INR 650 now using UPI.",
             ),
         )
     }
@@ -163,6 +191,34 @@ class TransactionSmsFilterTest {
     }
 
     @Test
+    fun `rejects settlement-like personal SMS from a phone number`() {
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "+919999999999",
+                "I paid INR 500 for dinner, send me your half.",
+            ),
+        )
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "[phone]",
+                "I paid INR 500 for dinner, send me your half.",
+            ),
+        )
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "FRIEND",
+                "I paid INR 500 for dinner, send me your half.",
+            ),
+        )
+        assertFalse(
+            TransactionSmsFilter.isTransactionCandidate(
+                "",
+                "INR 500 paid to GREEN LEAF CAFE.",
+            ),
+        )
+    }
+
+    @Test
     fun `redacts sensitive identifiers before payload creation`() {
         val sanitized = TransactionSmsFilter.sanitizeBody(
             "Paid INR 100 from A/C XX-1234 to ayush@oksbi; UTR N123456789; " +
@@ -187,5 +243,39 @@ class TransactionSmsFilterTest {
     fun `redacts phone-number sender`() {
         assertEquals("[phone]", TransactionSmsFilter.sanitizeSender("+91 98765 43210"))
     }
-}
 
+    @Test
+    fun `uploads only the minimized transaction clause`() {
+        val minimized = TransactionSmsFilter.minimizeTransactionBody(
+            "INR 500 debited at ZEPTO using card XX123456. Avl Bal INR 50,000. " +
+                "Never share your OTP. Get cashback on your next order.",
+        )
+        assertTrue(minimized.contains("INR 500 debited at ZEPTO"))
+        assertFalse(minimized.contains("XX123456"))
+        assertFalse(minimized.contains("50,000"))
+        assertFalse(minimized.contains("OTP"))
+        assertFalse(minimized.contains("cashback"))
+
+        val converted = TransactionSmsFilter.toTransactionSms(
+            SmsRecord(
+                localId = 1,
+                sender = "AX-HDFCBK",
+                receivedAtMillis = 1_786_000_000_000,
+                body = "INR 500 debited at ZEPTO. Avl Bal INR 50,000. Never share your OTP.",
+            ),
+        )
+        assertEquals("INR 500 debited at ZEPTO", converted?.body)
+    }
+
+    @Test
+    fun `does not upload when minimization removes the only settled evidence`() {
+        val record = SmsRecord(
+            localId = 2,
+            sender = "PAYAPP",
+            receivedAtMillis = 1_786_000_000_000,
+            body = "Account notice. Never share your OTP; INR 500 payment completed.",
+        )
+        assertTrue(TransactionSmsFilter.isTransactionCandidate(record.sender, record.body))
+        assertEquals(null, TransactionSmsFilter.toTransactionSms(record))
+    }
+}

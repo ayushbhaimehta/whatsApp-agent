@@ -54,7 +54,7 @@ class SmsSyncWorker(
 
         val candidates = records.asSequence()
             .filter { TransactionSmsFilter.isTransactionCandidate(it.sender, it.body) }
-            .map(TransactionSmsFilter::toTransactionSms)
+            .mapNotNull(TransactionSmsFilter::toTransactionSms)
             .distinctBy(TransactionSms::id)
             .toList()
 

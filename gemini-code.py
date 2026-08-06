@@ -32,6 +32,12 @@ import pandas as pd
 from datetime import datetime
 from html import escape
 from urllib.parse import urlparse
+from stock_intelligence import (
+    build_market_intelligence,
+    current_calendar_year,
+    extract_current_year_analyst_targets,
+    validate_current_year_analyst_record,
+)
 try:
     from google.colab import files, userdata
 except ImportError:
@@ -63,6 +69,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     # ==========================================
     TICKER_SYMBOL = str(TICKER_SYMBOL).strip().upper()
     CURRENT_DATE = datetime.now().strftime("%d %B %Y")
+    REPORT_YEAR = datetime.now().year
 
     # FMP analyst endpoints are paid/legacy for most new accounts. Keep disabled unless
     # you separately subscribe to the required FMP datasets.
@@ -728,9 +735,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         "ASML": "SEMI_EQUIPMENT", "AMAT": "SEMI_EQUIPMENT", "LRCX": "SEMI_EQUIPMENT",
         "KLAC": "SEMI_EQUIPMENT", "ONTO": "SEMI_EQUIPMENT", "CAMT": "SEMI_EQUIPMENT",
         "ACMR": "SEMI_EQUIPMENT", "UCTT": "SEMI_EQUIPMENT", "MKSI": "SEMI_EQUIPMENT",
-        # Networking, optics and interconnect
-        "ANET": "NETWORKING_OPTICS", "COHR": "NETWORKING_OPTICS", "LITE": "NETWORKING_OPTICS",
-        "AAOI": "NETWORKING_OPTICS", "FN": "NETWORKING_OPTICS",
+        # Wafer foundries / fabrication
+        "TSM": "WAFER_FOUNDRY", "INTC": "WAFER_FOUNDRY", "GFS": "WAFER_FOUNDRY",
+        "UMC": "WAFER_FOUNDRY", "SMIC": "WAFER_FOUNDRY",
+        # Networking, switching, photonics and interconnect
+        "ANET": "NETWORKING_OPTICS",
+        "COHR": "PHOTONICS_OPTICS", "LITE": "PHOTONICS_OPTICS",
+        "AAOI": "PHOTONICS_OPTICS", "FN": "PHOTONICS_OPTICS",
+        "IPGP": "PHOTONICS_OPTICS", "CIEN": "PHOTONICS_OPTICS",
         # Data-center electrical, cooling and distributed power
         "VRT": "DATA_CENTER_POWER", "ETN": "DATA_CENTER_POWER", "GEV": "DATA_CENTER_POWER",
         "PWR": "DATA_CENTER_POWER", "CARR": "DATA_CENTER_POWER", "BE": "DATA_CENTER_POWER",
@@ -742,8 +754,10 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         # Hyperscalers and mega-cap platforms
         "MSFT": "MEGA_CAP_PLATFORM", "GOOGL": "MEGA_CAP_PLATFORM", "GOOG": "MEGA_CAP_PLATFORM",
         "AMZN": "MEGA_CAP_PLATFORM", "META": "MEGA_CAP_PLATFORM", "AAPL": "MEGA_CAP_PLATFORM",
+        "ORCL": "MEGA_CAP_PLATFORM",
         # Power generators benefiting from data-center load growth
         "CEG": "POWER_GENERATION", "VST": "POWER_GENERATION", "NRG": "POWER_GENERATION",
+        "TLN": "POWER_GENERATION", "NEE": "POWER_GENERATION", "AEP": "POWER_GENERATION",
         # Data-center real estate
         "EQIX": "DATA_CENTER_REIT", "DLR": "DATA_CENTER_REIT",
     }
@@ -752,12 +766,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         "AI_COMPUTE": ["NVDA", "AMD", "AVGO", "MRVL", "CRDO", "ARM"],
         "MEMORY_STORAGE": ["MU", "WDC", "STX", "SNDK", "SIMO", "RMBS"],
         "SEMI_EQUIPMENT": ["ASML", "AMAT", "LRCX", "KLAC", "ONTO", "CAMT"],
-        "NETWORKING_OPTICS": ["ANET", "COHR", "LITE", "AAOI", "FN"],
+        "WAFER_FOUNDRY": ["TSM", "INTC", "GFS", "UMC"],
+        "NETWORKING_OPTICS": ["ANET", "AVGO", "MRVL", "CRDO"],
+        "PHOTONICS_OPTICS": ["COHR", "LITE", "AAOI", "FN", "IPGP", "CIEN"],
         "DATA_CENTER_POWER": ["VRT", "ETN", "GEV", "PWR", "CARR", "BE"],
         "AI_CLOUD_INFRA": ["CRWV", "NBIS", "IREN", "VRT", "ANET"],
         "AI_SOFTWARE": ["PLTR", "SNOW", "NOW", "CRM", "DDOG"],
-        "MEGA_CAP_PLATFORM": ["MSFT", "GOOGL", "AMZN", "META", "AAPL"],
-        "POWER_GENERATION": ["CEG", "VST", "NRG", "GEV"],
+        "MEGA_CAP_PLATFORM": ["MSFT", "GOOGL", "AMZN", "META", "ORCL"],
+        "POWER_GENERATION": ["CEG", "VST", "NRG", "GEV", "TLN", "NEE"],
         "DATA_CENTER_REIT": ["EQIX", "DLR"],
         "GENERAL_AI": ["MSFT", "NVDA", "AVGO", "VRT", "ANET"],
     }
@@ -766,7 +782,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         "AI_COMPUTE": "AI Compute Semiconductors",
         "MEMORY_STORAGE": "Memory & Storage Cycle",
         "SEMI_EQUIPMENT": "Semiconductor Equipment",
-        "NETWORKING_OPTICS": "AI Networking & Optics",
+        "WAFER_FOUNDRY": "Semiconductor Foundry / Wafer Fabrication",
+        "NETWORKING_OPTICS": "AI Networking & Switching",
+        "PHOTONICS_OPTICS": "AI Photonics & Optical Interconnect",
         "DATA_CENTER_POWER": "Data-Center Power & Cooling",
         "AI_CLOUD_INFRA": "AI Cloud Infrastructure",
         "AI_SOFTWARE": "AI Software & Data Platforms",
@@ -798,11 +816,23 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             "terminal_margin_floor": 0.16, "terminal_margin_cap": 0.38,
             "rd_life": 5, "outlier_band": (0.50, 2.00),
         },
+        "WAFER_FOUNDRY": {
+            "weights": {"DCF": 0.25, "Forward P/E": 0.35, "EV/EBITDA": 0.40},
+            "forecast_years": 10, "sales_to_capital": 0.72, "growth_cap": 0.32,
+            "terminal_margin_floor": 0.14, "terminal_margin_cap": 0.46,
+            "rd_life": 6, "outlier_band": (0.48, 2.05),
+        },
         "NETWORKING_OPTICS": {
             "weights": {"DCF": 0.18, "Forward P/E": 0.45, "EV/EBITDA": 0.37},
             "forecast_years": 10, "sales_to_capital": 1.45, "growth_cap": 0.40,
             "terminal_margin_floor": 0.10, "terminal_margin_cap": 0.36,
             "rd_life": 4, "outlier_band": (0.42, 2.30),
+        },
+        "PHOTONICS_OPTICS": {
+            "weights": {"DCF": 0.15, "Forward P/E": 0.38, "EV/EBITDA": 0.47},
+            "forecast_years": 10, "sales_to_capital": 1.20, "growth_cap": 0.45,
+            "terminal_margin_floor": 0.08, "terminal_margin_cap": 0.34,
+            "rd_life": 5, "outlier_band": (0.38, 2.45),
         },
         "DATA_CENTER_POWER": {
             "weights": {"DCF": 0.18, "Forward P/E": 0.30, "EV/EBITDA": 0.52},
@@ -908,11 +938,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         ]).lower()
         rules = [
             ("MEMORY_STORAGE", ["memory chip", "dram", "nand", "storage device", "hard disk"]),
-            ("SEMI_EQUIPMENT", ["semiconductor equipment", "wafer fabrication", "process control", "lithography"]),
-            ("NETWORKING_OPTICS", ["optical", "photonics", "transceiver", "network switch", "networking equipment"]),
+            ("WAFER_FOUNDRY", ["semiconductor foundry", "wafer fabrication", "wafer fab", "chip manufacturing", "process node"]),
+            ("SEMI_EQUIPMENT", ["semiconductor equipment", "process control", "lithography", "wafer equipment", "metrology"]),
+            ("PHOTONICS_OPTICS", ["silicon photonics", "photonics", "optical transceiver", "co-packaged optics", "laser diode"]),
+            ("NETWORKING_OPTICS", ["network switch", "networking equipment", "ethernet switching"]),
             ("DATA_CENTER_POWER", ["fuel cell", "electrical equipment", "power management", "cooling", "thermal management"]),
             ("AI_SOFTWARE", ["application software", "cloud software", "data analytics", "artificial intelligence software"]),
             ("AI_COMPUTE", ["graphics processor", "gpu", "semiconductor design", "integrated circuits"]),
+            ("MEGA_CAP_PLATFORM", ["hyperscale cloud", "cloud platform", "cloud infrastructure", "hyperscaler"]),
             ("POWER_GENERATION", ["independent power producer", "electric generation", "nuclear power"]),
             ("DATA_CENTER_REIT", ["data center reit", "real estate investment trust"]),
         ]
@@ -1642,6 +1675,71 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         f"Street comparison={street_comparison}."
     )
 
+    # -------------------------------------------------------------------------
+    # Public market evidence + technical overlay
+    # -------------------------------------------------------------------------
+    # Only public headline/feed metadata is collected. Article bodies, paywalls,
+    # authenticated sessions, and private social content are never accessed.
+    try:
+        yahoo_news_items = stock.get_news(count=40, tab="news") or []
+    except TypeError:
+        # Compatibility with yfinance releases that do not expose `tab`.
+        try:
+            yahoo_news_items = stock.get_news(count=40) or []
+        except Exception as exc:
+            print(f"Yahoo public-news note: {exc}")
+            yahoo_news_items = []
+    except Exception as exc:
+        print(f"Yahoo public-news note: {exc}")
+        yahoo_news_items = []
+
+    company_context = " ".join([
+        str(company_name), str(sector), str(industry),
+        str(info.get("longBusinessSummary") or ""),
+    ])
+    try:
+        market_intelligence = build_market_intelligence(
+            TICKER_SYMBOL,
+            company_name,
+            company_context,
+            {
+                "current_price": current_price,
+                "sma_50": sma_50,
+                "sma_200": sma_200,
+                "rsi_14": rsi_14,
+                # These values are decimal returns (for example 0.12 = +12%).
+                "momentum_3m": momentum_3m,
+                "momentum_6m": momentum_6m,
+                "momentum_12m": momentum_12m,
+            },
+            yahoo_items=yahoo_news_items,
+        )
+    except Exception as exc:
+        # News must remain enrichment-only. The technical fallback and the core
+        # valuation report still complete when every feed is unavailable.
+        print(f"Public market-intelligence note: {type(exc).__name__}: {exc}")
+        market_intelligence = {
+            "theme": valuation_archetype_id,
+            "items": [],
+            "all_public_items": [],
+            "diagnostics": [f"Collector unavailable: {type(exc).__name__}"],
+            "technical": {"score": 0.0, "coverage": 0.0},
+            "signal": {
+                "news_score": 0.0, "technical_score": 0.0, "combined_score": 0.0,
+                "label": "HOLD", "confidence": 0, "coverage": 0,
+                "evidence_count": 0, "source_count": 0,
+                "mode": "unavailable fallback",
+            },
+        }
+
+    market_signal = market_intelligence["signal"]
+    print(
+        "Market evidence signal: "
+        f"{market_signal['label']} ({market_signal['combined_score']:+.2f}); "
+        f"confidence={market_signal['confidence']}%, coverage={market_signal['coverage']}%, "
+        f"evidence={market_signal['evidence_count']} across {market_signal['source_count']} sources."
+    )
+
 
     # =========================================================
     # 6. INDIVIDUAL ANALYST FEED: DIRECT DATA + GROUNDED WEB SEARCH
@@ -1687,6 +1785,16 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             return value if parsed.scheme in {"http", "https"} and parsed.netloc else ""
         except Exception:
             return ""
+
+
+    def is_verifiable_current_year_action(record):
+        """Require an exact YTD date and supporting public URL for every row."""
+        if not isinstance(record, dict):
+            return False
+        return bool(
+            current_calendar_year(record.get("date"))
+            and safe_url(record.get("source_url"))
+        )
 
 
     def normalize_direct_record(item):
@@ -1754,12 +1862,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             return []
 
         prompt = f"""
-    Search the live public web for recent SELL-SIDE Wall Street analyst rating and
-    price-target actions for {company_name} ({TICKER_SYMBOL}) through {CURRENT_DATE}.
+    Search the live public web for SELL-SIDE Wall Street analyst rating and
+    price-target actions for {company_name} ({TICKER_SYMBOL}) dated from
+    {REPORT_YEAR}-01-01 through {CURRENT_DATE}, inclusive.
 
     Return up to 25 separate, individually attributable actions, newest first. Search
-    reputable financial-news pages and public analyst-action reports. Prefer the last
-    18 months, but extend to 24 months when needed to find enough records.
+    reputable financial-news pages and public analyst-action reports. This is a strict
+    current-calendar-year/YTD dataset: never return an action dated before
+    {REPORT_YEAR}-01-01, even when that means returning fewer records.
 
     Required fields:
     - date: exact action/publication date in YYYY-MM-DD
@@ -1778,7 +1888,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     4. Exclude crowd ratings, technical signals, anonymous forecasts, and AI predictions.
     5. Deduplicate the same analyst/firm/action/date.
     6. Every row must include a public source URL supporting the action.
-    7. Return {{"records": []}} when no individually verifiable records are found.
+    7. Exclude missing, ambiguous, future, and pre-{REPORT_YEAR} dates.
+    8. Return {{"records": []}} when no individually verifiable records are found.
     """
 
         print("Starting Gemini Google Search for individual analyst actions...")
@@ -1830,14 +1941,15 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             analyst = str(item.get("analyst") or "Not disclosed").strip()
             new_rating = str(item.get("new_rating") or "N/A").strip()
             target = to_float(item.get("price_target"))
+            action_date = str(item.get("date") or "N/A")
 
-            if not source_url or not firm:
+            if not source_url or not firm or not current_calendar_year(action_date):
                 continue
             if new_rating == "N/A" and target is None:
                 continue
 
             grounded.append({
-                "date": str(item.get("date") or "N/A"),
+                "date": action_date,
                 "analyst": analyst or "Not disclosed",
                 "firm": firm,
                 "previous_rating": str(item.get("previous_rating") or "N/A"),
@@ -1889,7 +2001,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
         prompt = f"""
     Search the live public web specifically for individually attributable SELL-SIDE
-    price-target actions for {company_name} ({TICKER_SYMBOL}) through {CURRENT_DATE}.
+    price-target actions for {company_name} ({TICKER_SYMBOL}) dated from
+    {REPORT_YEAR}-01-01 through {CURRENT_DATE}, inclusive.
 
     Return up to 25 recent rows, newest first, but include a row ONLY when a public
     source explicitly states a numeric USD price target for that firm or analyst.
@@ -1914,7 +2027,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     3. Never estimate, infer, currency-convert or split-adjust a target.
     4. Do not confuse EPS/revenue estimates with share-price targets.
     5. Deduplicate matching firm/date/target actions.
-    6. Return {{"records": []}} if no explicit targets are found.
+    6. Exclude missing, ambiguous, future, and pre-{REPORT_YEAR} dates.
+    7. Return {{"records": []}} if no explicit targets are found.
     """
 
         print("Starting dedicated Gemini Search for numeric analyst price targets...")
@@ -1945,17 +2059,19 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
                 continue
             target = to_float(item.get("price_target"))
             firm = str(item.get("firm") or "").strip()
-            if target is None or not firm:
+            action_date = str(item.get("date") or "N/A")
+            source_url = safe_url(item.get("source_url"))
+            if target is None or not firm or not source_url or not current_calendar_year(action_date):
                 continue
             rows.append({
-                "date": str(item.get("date") or "N/A"),
+                "date": action_date,
                 "analyst": str(item.get("analyst") or "Not disclosed").strip(),
                 "firm": firm,
                 "previous_rating": str(item.get("previous_rating") or "N/A").strip(),
                 "new_rating": str(item.get("new_rating") or "N/A").strip(),
                 "price_target": target,
                 "previous_price_target": to_float(item.get("previous_price_target")),
-                "source_url": safe_url(item.get("source_url")),
+                "source_url": source_url,
                 "source_title": str(item.get("source_title") or "Gemini Google Search grounded result"),
             })
         print(f"Dedicated target search returned {len(rows)} target-bearing rows.")
@@ -2071,18 +2187,54 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     analyst_records = []
     for raw_item in fmp_grades:
         normalized = normalize_direct_record(raw_item)
-        if normalized:
+        if normalized and is_verifiable_current_year_action(normalized):
             analyst_records.append(normalized)
 
     # Run both searches: one broad rating/action pass and one stricter numeric-target pass.
     grounded_records = fetch_grounded_analyst_records()
     target_records = fetch_grounded_target_records()
     yahoo_records = fetch_yahoo_fallback_records()
+    public_feed_target_records = extract_current_year_analyst_targets(
+        market_intelligence.get("all_public_items", []),
+        TICKER_SYMBOL,
+        company_name,
+        current_price,
+    )
+    if public_feed_target_records:
+        print(
+            "Public feeds supplied "
+            f"{len(public_feed_target_records)} explicit current-year target action(s)."
+        )
+
+    # Apply one independent trust boundary to every provider before records can
+    # merge. Besides YTD date/source checks, it rejects issuer-as-analyst errors
+    # and strips implausible numeric targets even if an LLM returned them.
+    def validated_records(rows):
+        validated = []
+        for row in rows:
+            cleaned = validate_current_year_analyst_record(
+                row, TICKER_SYMBOL, company_name, current_price,
+            )
+            if cleaned:
+                validated.append(cleaned)
+        return validated
+
+    analyst_records = validated_records(analyst_records)
+    yahoo_records = validated_records(yahoo_records)
+    grounded_records = validated_records(grounded_records)
+    target_records = validated_records(target_records)
+    public_feed_target_records = validated_records(public_feed_target_records)
 
     analyst_records.extend(yahoo_records)
     analyst_records.extend(grounded_records)
     analyst_records.extend(target_records)
+    analyst_records.extend(public_feed_target_records)
     analyst_records = merge_analyst_records(analyst_records)
+
+    # All sources, including Gemini and Yahoo, pass the same final YTD guardrail.
+    # Yahoo's upgrades/downgrades table often has no supporting action URL; those
+    # rows are intentionally excluded rather than presented as individually verified.
+    analyst_records = validated_records(analyst_records)
 
     # Final exact deduplication after enrichment.
     deduped = {}
@@ -2124,21 +2276,30 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         collected_target_high = None
         collected_target_low = None
 
-    # Published consensus is preferred. If unavailable, use the mean of individually
-    # collected target actions and label it clearly as a calculated sample.
+    # The report's primary analyst-target statistics are strict current-year/YTD.
+    # Yahoo's rolling 12-month consensus is retained only as a clearly separated
+    # supplemental snapshot; it is never mixed into these YTD calculations.
     published_consensus_available = not target_is_model_fallback and raw_target_mean is not None
-    combined_target_mean = raw_target_mean if published_consensus_available else collected_target_mean
-    combined_target_median = target_median if published_consensus_available else collected_target_median
-    combined_target_high = (
-        normalize_per_share_quote(yahoo_price_targets.get("high")) if published_consensus_available else collected_target_high
-    )
-    combined_target_low = (
-        normalize_per_share_quote(yahoo_price_targets.get("low")) if published_consensus_available else collected_target_low
-    )
+    combined_target_mean = collected_target_mean
+    combined_target_median = collected_target_median
+    combined_target_high = collected_target_high
+    combined_target_low = collected_target_low
     combined_target_source = (
-        "Published Yahoo analyst-price-target consensus"
-        if published_consensus_available
-        else "Calculated from target-bearing rows collected in this report"
+        f"Calculated only from {collected_target_count} verified {REPORT_YEAR} YTD target action(s)"
+        if collected_target_count
+        else f"No verified {REPORT_YEAR} YTD target actions were available"
+    )
+    rolling_consensus_mean = raw_target_mean if published_consensus_available else None
+    rolling_consensus_median = target_median if published_consensus_available else None
+    rolling_consensus_high = (
+        normalize_per_share_quote(yahoo_price_targets.get("high"))
+        or normalize_per_share_quote(info.get("targetHighPrice"))
+        if published_consensus_available else None
+    )
+    rolling_consensus_low = (
+        normalize_per_share_quote(yahoo_price_targets.get("low"))
+        or normalize_per_share_quote(info.get("targetLowPrice"))
+        if published_consensus_available else None
     )
 
     def money_or_na(value):
@@ -2194,7 +2355,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         analyst_rows_html = """
         <tr>
             <td colspan="6" style="text-align:center; color:#666; font-style:italic; padding:20px;">
-                No individually verifiable analyst actions were returned. Check GEMINI_API_KEY and its Google Search grounding quota.
+                No individually verifiable current-calendar-year analyst action with an exact date and public source URL was available. No target was invented.
             </td>
         </tr>
         """
@@ -2202,7 +2363,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     print(
         f"Compiled {analyst_count_found} individual analyst records; "
         f"{collected_target_count} contain explicit numeric targets "
-        f"({len(target_records)} from the dedicated target search)."
+        f"({len(target_records)} from grounded target search and "
+        f"{len(public_feed_target_records)} from public feed metadata)."
     )
 
 
@@ -2217,6 +2379,59 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     consensus_median_display = combined_target_median
     consensus_high_display = combined_target_high
     consensus_low_display = combined_target_low
+
+    market_label = str(market_signal.get("label") or "HOLD")
+    market_signal_class = (
+        "buy" if "BUY" in market_label
+        else "sell" if "SELL" in market_label
+        else "hold"
+    )
+    market_evidence_rows = ""
+    for evidence in market_intelligence.get("items", []):
+        published = evidence.get("published_at")
+        published_text = published.strftime("%b %d, %Y") if hasattr(published, "strftime") else "N/A"
+        source_text = escape(str(evidence.get("source") or "Public source"))
+        headline = escape(str(evidence.get("title") or "Untitled"))
+        evidence_url = safe_url(evidence.get("url"))
+        headline_html = (
+            f'<a href="{escape(evidence_url, quote=True)}" target="_blank" rel="noopener">{headline}</a>'
+            if evidence_url else headline
+        )
+        evidence_sentiment = float(evidence.get("sentiment") or 0.0)
+        evidence_class = "buy" if evidence_sentiment > 0.08 else "sell" if evidence_sentiment < -0.08 else "hold"
+        market_evidence_rows += f"""
+        <tr>
+            <td class="metric-name">{escape(published_text)}</td>
+            <td>{source_text}<br><span style="font-size:11px;color:#666;">Source score: {float(evidence.get('source_quality') or 0):.2f}</span></td>
+            <td>{headline_html}</td>
+            <td><span class="{evidence_class}">{evidence_sentiment:+.2f}</span></td>
+            <td>{float(evidence.get('weight') or 0):.2f}<br><span style="font-size:10px;color:#666;">Rel {float(evidence.get('relevance') or 0):.2f} · Fresh {float(evidence.get('freshness') or 0):.2f} · Corroboration {int(evidence.get('corroboration_count') or 0)} · Noise −{float(evidence.get('noise_penalty') or 0):.2f}</span></td>
+        </tr>
+        """
+    if not market_evidence_rows:
+        market_evidence_rows = """
+        <tr><td colspan="5" style="text-align:center;color:#666;font-style:italic;padding:20px;">
+            No sufficiently relevant, recent public headline evidence passed the noise filter. The displayed signal is a low-confidence technical-only fallback.
+        </td></tr>
+        """
+    thin_evidence_note = (
+        "<strong>Low-evidence warning:</strong> Fewer than three independent relevant items, or less than 30% evidence coverage, passed the filter. Treat this signal as preliminary."
+        if int(market_signal.get("evidence_count") or 0) < 3 or int(market_signal.get("coverage") or 0) < 30
+        else "Evidence coverage passed the minimum breadth threshold; disagreement is reflected in confidence."
+    )
+    market_diagnostics = market_intelligence.get("diagnostics", [])
+    market_diagnostic_note = (
+        " Some optional feeds were unavailable and skipped: " + escape(", ".join(str(note) for note in market_diagnostics[:3])) + "."
+        if market_diagnostics else ""
+    )
+    rolling_consensus_note = (
+        "<strong>Supplemental rolling provider snapshot (not part of YTD statistics):</strong> "
+        f"mean {money_or_na(rolling_consensus_mean)}, median {money_or_na(rolling_consensus_median)}, "
+        f"high/low {money_or_na(rolling_consensus_high)} / {money_or_na(rolling_consensus_low)}, "
+        f"provider opinion count {consensus_analyst_count or 'N/A'}. The provider does not expose a publication date for every underlying estimate."
+        if published_consensus_available else
+        "<strong>Supplemental rolling provider snapshot:</strong> unavailable."
+    )
 
     html_content = f"""
     <!DOCTYPE html>
@@ -2281,9 +2496,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
                 <td>Scenario range generated from the same independent architecture with different growth, margin, multiple and discount-rate assumptions.</td>
             </tr>
             <tr>
-                <td class="metric-name">Published Analyst Mean Target</td>
+                <td class="metric-name">Verified {REPORT_YEAR} YTD Analyst Mean</td>
                 <td>{money_or_na(consensus_mean_display)}</td>
-                <td>{money_or_na(consensus_mean_display * 0.80 if isinstance(consensus_mean_display, (int, float)) else None)}</td>
+                <td>N/A — comparison only</td>
                 <td>{escape(combined_target_source)}.</td>
             </tr>
             <tr>
@@ -2300,19 +2515,33 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         </table>
         <div class="note"><strong>Architecture:</strong> {escape(valuation_archetype)}. Analyst price-target weight: 0%. FY1/FY2 operating-estimate weight: {operating_estimate_weight:.0%}. Model versus Street: {escape(street_comparison)}.</div>
 
-        <h2>2. Wall Street Analyst Consensus & Recent Actions</h2>
+        <h2>2. Verified Wall Street Actions — {REPORT_YEAR} YTD</h2>
         <div class="summary-grid">
-            <div class="card"><div class="label">Mean Target</div><div class="value">{money_or_na(consensus_mean_display)}</div></div>
-            <div class="card"><div class="label">Median Target</div><div class="value">{money_or_na(consensus_median_display)}</div></div>
-            <div class="card"><div class="label">High / Low</div><div class="value">{money_or_na(consensus_high_display)} / {money_or_na(consensus_low_display)}</div></div>
-            <div class="card"><div class="label">Analyst Count</div><div class="value">{consensus_analyst_count or 'N/A'}</div></div>
+            <div class="card"><div class="label">YTD Mean Target</div><div class="value">{money_or_na(consensus_mean_display)}</div></div>
+            <div class="card"><div class="label">YTD Median Target</div><div class="value">{money_or_na(consensus_median_display)}</div></div>
+            <div class="card"><div class="label">YTD High / Low</div><div class="value">{money_or_na(consensus_high_display)} / {money_or_na(consensus_low_display)}</div></div>
+            <div class="card"><div class="label">Verified YTD Target Rows</div><div class="value">{collected_target_count}</div></div>
         </div>
         <table>
             <tr><th>Date</th><th>Analyst</th><th>Firm</th><th>Previous Rating</th><th>New Rating</th><th>Price Target</th></tr>
             {analyst_rows_html}
         </table>
+        <div class="note"><strong>Date policy:</strong> Individual rows and all four primary target cards are limited to {REPORT_YEAR}-01-01 through {escape(CURRENT_DATE)} and require an exact date plus public supporting URL. Missing individual targets remain N/A; no rolling or prior-year estimate is mixed into the YTD statistics.<br><br>{rolling_consensus_note}</div>
 
-        <h2>3. Technical Analysis & Momentum Indicators</h2>
+        <h2>3. Noise-Filtered Public Market Sentiment</h2>
+        <div class="summary-grid">
+            <div class="card"><div class="label">Combined Signal</div><div class="value"><span class="{market_signal_class}">{escape(market_label)}</span></div></div>
+            <div class="card"><div class="label">News / Technical Score</div><div class="value">{float(market_signal.get('news_score') or 0):+.2f} / {float(market_signal.get('technical_score') or 0):+.2f}</div></div>
+            <div class="card"><div class="label">Confidence</div><div class="value">{int(market_signal.get('confidence') or 0)}%</div></div>
+            <div class="card"><div class="label">Coverage</div><div class="value">{int(market_signal.get('coverage') or 0)}% ({int(market_signal.get('source_count') or 0)} sources)</div></div>
+        </div>
+        <table>
+            <tr><th>Date</th><th>Source & Quality</th><th>Relevant Public Headline</th><th>Sentiment</th><th>Final Weight & Filters</th></tr>
+            {market_evidence_rows}
+        </table>
+        <div class="note"><strong>Method:</strong> Public Yahoo metadata, Google News RSS, optional GDELT/Reddit public feeds, and the optional official X API; no article-body scraping or paywall bypass. Each relevant item is weighted by publisher quality, exactly matched operator-reviewed author reputation, freshness, independent corroboration and ticker/company relevance, then reduced for spam/clickbait noise. Syndicated duplicates contribute corroboration but not extra votes. The final five-level signal combines filtered evidence with price trend, moving averages, momentum and RSI. Mode: {escape(str(market_signal.get('mode') or 'N/A'))}. {thin_evidence_note}{market_diagnostic_note}</div>
+
+        <h2>4. Technical Analysis & Momentum Indicators</h2>
         <table>
             <tr><th>Technical Indicator</th><th>Current Value</th><th>Type</th><th>How to Use</th></tr>
             <tr><td class="metric-name">Resistance 1 (R1)</td><td>{fmt_money(r1)}</td><td>Ceiling</td><td>Short-term resistance and potential profit-taking area.</td></tr>
@@ -2324,7 +2553,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             <tr><td class="metric-name">14-Day RSI</td><td><span class="{rsi_class}">{rsi_14:.1f}</span></td><td>Oscillator</td><td>Below 30 is oversold; above 70 is overbought.</td></tr>
         </table>
 
-        <h2>4. Extended Fundamental Health Metrics</h2>
+        <h2>5. Extended Fundamental Health Metrics</h2>
         <table>
             <tr><th>Metric</th><th>Value</th><th>Reference</th><th>Interpretation</th></tr>
             <tr><td class="metric-name">Trailing P/E</td><td>{fmt_multiple(trailing_pe)}</td><td>Sector dependent</td><td>Use cautiously for cyclical or loss-making businesses.</td></tr>
@@ -2336,7 +2565,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             <tr><td class="metric-name">Operating Margin</td><td>{fmt_pct(current_operating_margin)}</td><td>Higher is better</td><td>Measures current operating profitability.</td></tr>
         </table>
 
-        <div class="note"><strong>Important:</strong> This automated model uses public data only.</div>
+        <div class="note"><strong>Important:</strong> This automated research model uses public data only. Sentiment and model ratings are evidence summaries, not investment advice or guarantees.</div>
     </div>
     </body>
     </html>

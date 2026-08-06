@@ -73,12 +73,18 @@ const {
     BUDGET_CRON_EXPRESSION,
     buildBudgetEnrichmentPrompt,
     buildMerchantCategoryPrompt,
+    buildBudgetRuleMerchantMatchPrompt,
     canonicalChannelCategory,
     canonicalItemCategory,
     formatBudgetWhatsApp,
     generateMonthlyBudgetReport,
     integerFromEnv,
-    loadBudgetGmailOAuthClient
+    loadBudgetCategoryRules,
+    loadBudgetGmailOAuthClient,
+    normalizeBudgetCategoryRuleProposals,
+    normalizePeriod,
+    persistBudgetCategoryRules,
+    regenerateMonthlyBudgetReportFromExisting
 } = require('./budget-reports');
 const { createSmsIngestionServer } = require('./sms-ingestion');
 const {
@@ -105,6 +111,7 @@ const {
     isAgentGeneratedMessageBody,
     normalizeMediaMimeType,
     parseMonthlyBudgetRequest,
+    resolveBudgetCategoryOperation,
     resolveTextShortcut,
     resolveGeminiAction
 } = require('./message-policy');
@@ -429,10 +436,6 @@ client.on('disconnected', reason => {
 });
 
 client.on('message_create', async (msg) => {
-    // Audit every newly created incoming and outgoing message before applying any
-    // feature-specific chat or time filters. This makes chat-ID discovery easy.
-    await auditWhatsAppMessage(msg);
-
     // --- GUARD: Ignore bot's own generated responses to avoid loops ---
     const body = msg.body || "";
     if (isAgentGeneratedMessageBody(body)) return;
@@ -453,6 +456,21 @@ client.on('message_create', async (msg) => {
     // --- GUARD 0: Prevent Duplicate Processing ---
     const messageCacheKey = getMessageCacheKey(msg);
     if (messageCacheKey && processedMessageIds.has(messageCacheKey)) return;
+    // Reserve the ID before the first await. whatsapp-web.js can emit the same
+    // message twice while chat metadata is still resolving; reserving it later
+    // allowed both async handlers to reach Sheets/Tasks concurrently.
+    if (messageCacheKey) {
+        processedMessageIds.add(messageCacheKey);
+        if (processedMessageIds.size > 200) {
+            const oldestId = processedMessageIds.values().next().value;
+            processedMessageIds.delete(oldestId);
+        }
+    }
+
+    // Audit every unique newly created incoming and outgoing message before
+    // applying feature-specific chat or time filters. This makes chat-ID
+    // discovery easy without duplicating audit rows.
+    await auditWhatsAppMessage(msg);
 
     const cookChatId = process.env.COOK_CHAT_ID;
     const configuredPersonalChatId = String(process.env.PERSONAL_CHAT_ID || '').trim();
@@ -474,15 +492,6 @@ client.on('message_create', async (msg) => {
     // Log ignored chats
     if (!isCookChat && !isPrivateChat) {
         return; // Ignore silently
-    }
-
-    // Mark as processed & manage cache size
-    if (messageCacheKey) {
-        processedMessageIds.add(messageCacheKey);
-        if (processedMessageIds.size > 200) {
-            const oldestId = processedMessageIds.values().next().value;
-            processedMessageIds.delete(oldestId);
-        }
     }
 
     console.log(`-------------------------------------------`);
@@ -515,7 +524,8 @@ client.on('message_create', async (msg) => {
         // Financial commands fail closed everywhere except the exact configured
         // PERSONAL_CHAT_ID. This happens before Gemini so a cook-chat budget
         // request cannot be reinterpreted or sent to an external model.
-        if (mimeType === 'text/plain' && !isConfiguredPersonalChat && parseMonthlyBudgetRequest(inputData)) {
+        const budgetRequestHint = mimeType === 'text/plain' ? parseMonthlyBudgetRequest(inputData) : null;
+        if (!isConfiguredPersonalChat && budgetRequestHint) {
             console.warn('Blocked a monthly-budget request outside the configured PERSONAL_CHAT_ID.');
             return;
         }
@@ -549,23 +559,43 @@ client.on('message_create', async (msg) => {
         try {
             result = await processWithGemini(inputData, mimeType);
         } catch (geminiError) {
-            const budgetFallback = isConfiguredPersonalChat && mimeType === 'text/plain'
-                ? parseMonthlyBudgetRequest(inputData)
-                : null;
+            const budgetFallback = isConfiguredPersonalChat ? budgetRequestHint : null;
             if (!budgetFallback) throw geminiError;
+            if (budgetFallback.requiresRuleInterpretation) {
+                const error = new Error('Gemini must be available to interpret a natural-language budget category rule safely. No rule or report change was made.');
+                error.code = 'BUDGET_CATEGORY_RULE_INTERPRETATION_FAILED';
+                error.cause = geminiError;
+                throw error;
+            }
             console.warn('Gemini intent analysis was unavailable; using the narrow monthly-budget phrase fallback.');
             result = { intent: 'monthly_budget', period: budgetFallback.period, items: [] };
         }
-        if (result?.intent === 'none' && isConfiguredPersonalChat && mimeType === 'text/plain') {
-            const budgetFallback = parseMonthlyBudgetRequest(inputData);
-            if (budgetFallback) result = { intent: 'monthly_budget', period: budgetFallback.period, items: [] };
+        if (result?.intent === 'none' && isConfiguredPersonalChat && budgetRequestHint) {
+            if (budgetRequestHint.requiresRuleInterpretation) {
+                const error = new Error('The budget category instruction could not be converted into a safe merchant rule. No rule or report change was made.');
+                error.code = 'BUDGET_CATEGORY_RULE_INTERPRETATION_FAILED';
+                throw error;
+            }
+            result = { intent: 'monthly_budget', period: budgetRequestHint.period, items: [] };
+        }
+        const safeBudgetCategoryOperation = resolveBudgetCategoryOperation(
+            mimeType === 'text/plain' ? inputData : '',
+            result?.budget_category_operation
+        );
+        if (result?.intent === 'monthly_budget' && budgetRequestHint?.requiresRuleInterpretation &&
+            safeBudgetCategoryOperation !== 'clear' &&
+            (!Array.isArray(result.budget_category_rules) || result.budget_category_rules.length === 0)) {
+            const error = new Error('The budget category instruction did not produce a bounded merchant rule. No rule or report change was made.');
+            error.code = 'BUDGET_CATEGORY_RULE_INTERPRETATION_FAILED';
+            throw error;
         }
         console.log(`🔍 Gemini intent resolved: intent="${result.intent}"`);
         const resolvedAction = resolveGeminiAction({
             result,
             isCookChat,
             isPrivateChat,
-            canAccessBudget: isConfiguredPersonalChat
+            canAccessBudget: isConfiguredPersonalChat,
+            budgetInstructionText: mimeType === 'text/plain' ? inputData : ''
         });
 
         // All confirmations are delivered to the explicitly configured personal chat.
@@ -657,14 +687,18 @@ client.on('message_create', async (msg) => {
                 console.warn('Blocked monthly-budget delivery outside PERSONAL_CHAT_ID.');
                 return;
             }
+            const isRuleUpdate = (resolvedAction.budgetCategoryRules?.length || 0) > 0 ||
+                ['replace', 'clear'].includes(resolvedAction.budgetCategoryOperation);
             await client.sendMessage(
                 budgetChatId,
-                `💰 *Budget report status*\n\nVerifying the complete mobile SMS scan and collecting available receipt emails for ${resolvedAction.period || 'the current month'}...`
+                `💰 *Budget report status*\n\n${isRuleUpdate ? 'Saving the private month-specific category preference and regenerating' : 'Verifying the complete mobile SMS scan and generating'} the report for ${resolvedAction.period || 'the current month'}...`
             );
             await enqueueBudgetJob(() => runMonthlyBudgetReport({
                 chatId: budgetChatId,
                 period: resolvedAction.period || 'current_month',
-                trigger: 'whatsapp'
+                trigger: isRuleUpdate ? 'whatsapp_recategorization' : 'whatsapp',
+                categoryRuleProposals: resolvedAction.budgetCategoryRules || [],
+                categoryRuleOperation: resolvedAction.budgetCategoryOperation || 'merge'
             }));
         }
 
@@ -674,6 +708,10 @@ client.on('message_create', async (msg) => {
         if (errorChatId) {
             const errorMessage = error?.code === 'SMS_SCAN_REQUIRED'
                 ? `A complete current-month mobile SMS sync is mandatory before a budget report can be generated. ${conciseError(error)}`
+                : error?.code === 'BUDGET_CATEGORY_RULE_INTERPRETATION_FAILED' || error?.code === 'BUDGET_CATEGORY_RULE_INVALID'
+                    ? conciseError(error)
+                : error?.code === 'BUDGET_REPORT_NOT_FOUND' || error?.code === 'BUDGET_REPORT_INVALID'
+                    ? `${conciseError(error)} Sync the month in SMS Budget Companion, then request the budget report again.`
                 : 'I could not process the last request. This may be a temporary Gemini, Google API, or network issue. Please try again shortly.';
             await client.sendMessage(
                 errorChatId,
@@ -958,6 +996,18 @@ async function classifyBudgetBatchWithGemini(transactions, mode = 'receipt') {
     return JSON.parse(jsonText);
 }
 
+async function matchBudgetCategoryRulesWithGemini(merchantRecords, rules) {
+    const prompt = buildBudgetRuleMerchantMatchPrompt(merchantRecords, rules);
+    const { response } = await generateWithGeminiFallback({
+        models: jsonModels,
+        contents: [prompt],
+        operation: 'private budget merchant-name rule matching'
+    });
+    const rawText = response.response.text().trim();
+    const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    return JSON.parse(jsonText);
+}
+
 function parseMonthlyBudgetPaise() {
     const rupees = Number(process.env.MONTHLY_BUDGET_INR);
     return Number.isFinite(rupees) && rupees > 0 ? Math.round(rupees * 100) : null;
@@ -970,6 +1020,10 @@ function getSmsTransactionStorePath() {
 
 function getSmsScanStatePath() {
     return process.env.SMS_SCAN_STATE_PATH || getPrivateAgentDataPath('budget-data', 'android-sms-scan-state.json');
+}
+
+function getBudgetCategoryRulesPath() {
+    return process.env.BUDGET_CATEGORY_RULES_PATH || getPrivateAgentDataPath('budget-data', 'category-rules.json');
 }
 
 function getPrivateAgentDataPath(...segments) {
@@ -1091,15 +1145,58 @@ function startSwiggyOrderSyncSchedule() {
     console.log(`Swiggy order-history sync active: startup plus ${expression} Asia/Kolkata.`);
 }
 
-async function runMonthlyBudgetReport({ chatId, period = 'current_month', trigger = 'scheduled' }) {
+async function runMonthlyBudgetReport({
+    chatId,
+    period = 'current_month',
+    trigger = 'scheduled',
+    categoryRuleProposals = [],
+    categoryRuleOperation = 'merge'
+}) {
     const budgetChatId = assertBudgetDeliveryChatId({
         personalChatId: process.env.PERSONAL_CHAT_ID,
         requestedChatId: chatId
     });
-    if (process.env.SMS_INGESTION_ENABLED === 'false') {
-        const error = new Error('Android SMS ingestion is disabled. Set SMS_INGESTION_ENABLED=true, keep the agent online, and sync the SMS Budget Companion before retrying.');
-        error.code = 'SMS_SCAN_REQUIRED';
+    const monthKey = normalizePeriod(period);
+    const normalizedRuleProposals = normalizeBudgetCategoryRuleProposals(categoryRuleProposals);
+    const hasRuleCommand = categoryRuleOperation === 'clear' || categoryRuleOperation === 'replace' || categoryRuleProposals.length > 0;
+    if (categoryRuleProposals.length > 0 && normalizedRuleProposals.length === 0) {
+        const error = new Error('The requested budget category rule did not contain a safe category label and bounded merchant selector.');
+        error.code = 'BUDGET_CATEGORY_RULE_INVALID';
         throw error;
+    }
+    if (categoryRuleOperation === 'replace' && normalizedRuleProposals.length === 0) {
+        const error = new Error('Replacing budget category rules requires at least one valid rule. Use an explicit clear/reset request to remove them.');
+        error.code = 'BUDGET_CATEGORY_RULE_INVALID';
+        throw error;
+    }
+    const categoryRulePath = getBudgetCategoryRulesPath();
+    const ruleUpdate = hasRuleCommand
+        ? persistBudgetCategoryRules({
+            filePath: categoryRulePath,
+            period: monthKey,
+            proposals: normalizedRuleProposals,
+            operation: categoryRuleOperation
+        })
+        : null;
+    const categoryRules = ruleUpdate?.rules || loadBudgetCategoryRules({ filePath: categoryRulePath, period: monthKey });
+    const reportOutputDirectory = getPrivateAgentDataPath('budget-reports');
+    const regenerateExisting = () => regenerateMonthlyBudgetReportFromExisting({
+        period: monthKey,
+        categoryRules,
+        matchCategoryRules: matchBudgetCategoryRulesWithGemini,
+        monthlyBudgetPaise: parseMonthlyBudgetPaise(),
+        outputDirectory: reportOutputDirectory
+    });
+
+    let result;
+    if (process.env.SMS_INGESTION_ENABLED === 'false') {
+        if (hasRuleCommand) {
+            result = await regenerateExisting();
+        } else {
+            const error = new Error('Android SMS ingestion is disabled. Set SMS_INGESTION_ENABLED=true, keep the agent online, and sync the SMS Budget Companion before retrying.');
+            error.code = 'SMS_SCAN_REQUIRED';
+            throw error;
+        }
     }
     const budgetTokenPath = process.env.BUDGET_GMAIL_TOKEN_PATH || getPrivateAgentDataPath('google-budget-token.json');
     let gmailAuthClient = null;
@@ -1110,22 +1207,36 @@ async function runMonthlyBudgetReport({ chatId, period = 'current_month', trigge
     }
 
     console.log(`Starting ${trigger} monthly budget report for ${period}...`);
-    const swiggyOrderHistory = await enqueueSwiggyOrderSync('budget_report');
-    const result = await generateMonthlyBudgetReport({
-        period,
-        gmailAuthClient,
-        gmailMaxMessages: integerFromEnv(process.env.BUDGET_GMAIL_MESSAGE_LIMIT, 250, { min: 10, max: 2000 }),
-        smsStorePath: getSmsTransactionStorePath(),
-        smsStoreSecret: getSmsIngestionSecret(),
-        smsScanStatePath: getSmsScanStatePath(),
-        smsScanMaxAgeMs: integerFromEnv(process.env.SMS_SCAN_MAX_AGE_HOURS, 12, { min: 1, max: 72 }) * 60 * 60 * 1000,
-        classifyBatch: classifyBudgetBatchWithGemini,
-        swiggyOrders: swiggyOrderHistory.orders,
-        swiggyWarnings: swiggyOrderHistory.warnings,
-        swiggyCoverage: swiggyOrderHistory.coverage,
-        monthlyBudgetPaise: parseMonthlyBudgetPaise(),
-        outputDirectory: getPrivateAgentDataPath('budget-reports')
-    });
+    if (!result) {
+        const swiggyOrderHistory = await enqueueSwiggyOrderSync('budget_report');
+        try {
+            result = await generateMonthlyBudgetReport({
+                period: monthKey,
+                gmailAuthClient,
+                gmailMaxMessages: integerFromEnv(process.env.BUDGET_GMAIL_MESSAGE_LIMIT, 250, { min: 10, max: 2000 }),
+                smsStorePath: getSmsTransactionStorePath(),
+                smsStoreSecret: getSmsIngestionSecret(),
+                smsScanStatePath: getSmsScanStatePath(),
+                smsScanMaxAgeMs: integerFromEnv(process.env.SMS_SCAN_MAX_AGE_HOURS, 12, { min: 1, max: 72 }) * 60 * 60 * 1000,
+                classifyBatch: classifyBudgetBatchWithGemini,
+                swiggyOrders: swiggyOrderHistory.orders,
+                swiggyWarnings: swiggyOrderHistory.warnings,
+                swiggyCoverage: swiggyOrderHistory.coverage,
+                categoryRules,
+                matchCategoryRules: matchBudgetCategoryRulesWithGemini,
+                monthlyBudgetPaise: parseMonthlyBudgetPaise(),
+                outputDirectory: reportOutputDirectory
+            });
+        } catch (error) {
+            if (hasRuleCommand && error?.code === 'SMS_SCAN_REQUIRED') {
+                console.warn('Fresh SMS coverage is unavailable; recategorizing the existing private report instead.');
+                result = await regenerateExisting();
+            } else {
+                throw error;
+            }
+        }
+    }
+    result.categoryRuleUpdate = ruleUpdate;
 
     try {
         await persistBudgetReportToSheets(result.report, trigger);
@@ -1262,6 +1373,7 @@ async function processWithGemini(input, mimeType) {
         - If the user asks for suggestions, recommendations, or options of what to eat or cook (e.g., "suggest", "suggest dinner", "what should I eat", "recommend some breakfast options", "vegetarians option suggest"), intent is 'suggest_meal'.
         - If the user asks to summarize what they ate today, requests a daily report, or asks for macro totals (e.g., "summarize for the day", "summarize", "daily summary", "what did I eat today"), intent is 'summarize_day'.
         - If the user asks for their monthly spending, expenses, budget, payment breakdown, transaction summary, or how much they spent this month, intent is 'monthly_budget'. This includes natural Hindi/English requests such as "is mahine ka budget batao" or "where did my money go this month". Do not use this intent for "budget meal" or inexpensive meal suggestions. Set period to "current_month" unless the user explicitly names a month, in which case use YYYY-MM.
+        - Also use 'monthly_budget' for a request to recategorize, regroup, rename, or regenerate a budget report, including standalone corrections such as "categorize Bottle Lab as Office Cafe" or "put restaurants under Eating Out". These are financial category instructions, not food logging.
         - Otherwise, if the message contains the name of any recognizable food, ingredient, dish, beverage, or meal, intent is 'log_food' even when it is only a bare food list and contains no verb. Examples: "chana and paneer chaat for breakfast", "2 rotis dal", "one coffee", "paneer", or "breakfast poha and milk". Do not require words such as ate, make, cook, or log.
         - Also use 'log_food' when the message states, requests, plans, or instructs that a food/dish be made, cooked, prepared, served, eaten, or consumed. Treat concrete preparation statements such as "make paneer and two rotis", "cook dal for dinner", or "aaj poha banana" as food to estimate and log; consumption need not be explicitly stated.
         - Use 'none' only when no food is identifiable and none of the other intents apply.
@@ -1277,6 +1389,15 @@ async function processWithGemini(input, mimeType) {
             "intent": "log_food" | "add_reminder" | "suggest_meal" | "summarize_day" | "monthly_budget" | "none",
             "meal_type": "string", // ONLY for 'suggest_meal'. Specify the meal type they asked for (e.g., "Breakfast", "Lunch", "Dinner", "Snack"). If not specified or clear, output "Unknown".
             "period": "current_month" | "YYYY-MM", // ONLY for 'monthly_budget'.
+            "budget_category_operation": "merge" | "replace" | "clear", // ONLY for 'monthly_budget'. Default to "merge". Use "clear" only when the user explicitly asks to reset/remove all custom categories for that month. Use "replace" only when explicitly asked to replace all earlier rules.
+            "budget_category_rules": [ // ONLY for a monthly-budget categorization instruction; otherwise [].
+                {
+                    "category_label": "user-requested category name",
+                    "merchant_names": ["literal merchant names explicitly named by the user"],
+                    "merchant_types": ["food_business" | "person_transfer" | "online_food_platform" | "online_delivery_platform" | "office_cafeteria" | "grocery_business" | "utilities_business" | "transport_business" | "travel_business" | "health_business" | "personal_care_business" | "education_business" | "donation_recipient" | "housing_business" | "subscription_business" | "entertainment_business" | "shopping_business" | "services_business" | "financial_services_business"],
+                    "current_categories": ["online_food" | "online_delivery" | "office_cafeteria" | "misc_food" | "groceries" | "utilities" | "transport" | "travel" | "shopping" | "health" | "personal_care" | "education" | "donations" | "housing" | "subscriptions" | "entertainment" | "services" | "financial_services" | "ayush_transfers" | "transfer" | "forex" | "miscellaneous"]
+                }
+            ],
             "items": [
                 {
                     "item": "string",
@@ -1291,6 +1412,14 @@ async function processWithGemini(input, mimeType) {
             ]
         }
         
+        Budget category-rule constraints:
+        - Interpret the user's requested mapping, but never emit regex, executable code, free-form predicates, message text, payment amounts, phone numbers, sender names, references, or credentials.
+        - merchant_names may contain only merchant names that the user explicitly wrote. Do not invent examples or expand a brand into related brands.
+        - For "restaurants", "food stalls", cafes, bakeries, dhabas, canteens, sweets/snacks shops, or names that signify prepared-food businesses, use merchant_types ["food_business"].
+        - Rules are alternatives within a target category: exact merchant names, allowed semantic merchant types, and/or existing allowed categories. Leave unused arrays empty.
+        - "Forex" and "Ayush transfers" are reserved deterministic categories. Never emit either as category_label; existing transactions in those categories cannot be moved by a custom rule.
+        - Never create a rule without at least one bounded selector. A normal budget request has budget_category_rules [] and operation "merge".
+
         If 'suggest_meal', 'summarize_day', or 'monthly_budget', set "items" to an empty array.
     `;
 

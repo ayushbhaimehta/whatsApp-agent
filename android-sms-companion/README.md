@@ -1,6 +1,6 @@
 # SMS Budget Companion (Android)
 
-This is a small, sideloadable Android companion for the WhatsApp budget agent. On every sync it reads the **entire SMS inbox for the current month in Asia/Kolkata**, filters messages locally, and sends only likely settled transactions containing an INR amount to the agent's private HTTPS ingestion endpoint. OTP/authentication messages, promotions, balance and due notices, failed/pending payments, self-transfers, credit-card bill payment confirmations, order-status-only messages, and ordinary personal messages are discarded before payload construction.
+This is a small, sideloadable Android companion for the WhatsApp budget agent. On every sync it reads the **entire SMS inbox for the current month in Asia/Kolkata**, filters messages locally, and sends only completed INR transaction alerts that contain explicit payment/debit/refund/transfer evidence and come from a non-personal automated sender to the agent's private HTTPS ingestion endpoint. Phone-number/unknown senders, OTP/authentication messages, promotions, balance/statement/due notices, requests and failed/pending payments, self-transfers, credit-card bill payment confirmations, order-status-only messages, and ordinary personal messages are discarded before payload construction.
 
 It does not scrape another app's private storage and it does not upload the full SMS inbox. After all transaction batches succeed, it sends an empty, count-only completion checkpoint so the desktop agent can verify that the full current-month inbox scan completed. No non-transaction SMS body is included in that checkpoint.
 
@@ -11,9 +11,9 @@ Incoming SMS / six-hour WorkManager scan
                   |
           current-month inbox query
                   |
-      settled INR transaction filter
+ completed INR event + automated-sender filter
                   |
- UPI ID / phone / account / card / reference redaction
+  irrelevant tails removed + identifier redaction
                   |
   schema-v2 batches of at most 100 candidates
                   |
@@ -22,6 +22,10 @@ Incoming SMS / six-hour WorkManager scan
   signed empty full-scan completion checkpoint
                   |
      /v1/sms/transactions on the agent
+                  |
+     same transaction-only filter again
+                  |
+ optional Gemini: hashed row ID + merchant name only
 ```
 
 The incoming-SMS broadcast only enqueues work. It never sends broadcast extras over the network. Every run starts again at midnight IST on the first day of the current month, so completeness does not depend on an incremental cursor. The fixed scan ID and window tie all batches and the final checkpoint to one scan; deterministic message IDs let the server safely deduplicate full rescans and retries.
@@ -113,10 +117,13 @@ Redirect following is disabled so credentials cannot be forwarded to another hos
 - Android backups and device-to-device transfer are disabled for encrypted preferences.
 - Cleartext HTTP is disabled in the application and network security configuration.
 - OTP/authentication codes are rejected locally even if they mention an amount or transaction.
-- An actual INR amount plus transaction language is required. Order/delivery status without an amount is not budget evidence and is not uploaded.
-- Balance-only and due notices, failed/pending payments, self-transfers, credit-card bill payment confirmations, and promotional messages are excluded to prevent false spending or double counting.
+- An actual INR amount plus explicit completed payment/debit/refund/transfer evidence is required. Generic words such as “payment”, “UPI”, or “transaction” are not sufficient. Order/delivery status and payment requests are not uploaded.
+- Phone-number and unknown/private senders are rejected even if their text resembles a payment alert. This prevents ordinary person-to-person SMS conversations such as “I paid INR 500” from leaving the phone.
+- Balance-only, statement and due notices, failed/pending payments, self-transfers, credit-card bill payment confirmations, and promotional messages are excluded to prevent false spending or double counting.
 - Links, emails, UPI IDs, explicit PIN/CVV values, phone numbers (including spaced/international forms), and labelled/masked account, card, UTR, RRN, UPI/transaction references are redacted before upload. Phone-number senders are also redacted.
-- Every sync reads all inbox messages from the start of the current month in Asia/Kolkata through the scan start time. Only locally filtered, redacted transaction candidates leave the phone.
+- Security, balance, and promotional tails are removed from accepted alerts, and the remaining redacted transaction body is capped at 750 characters.
+- Every sync reads all inbox messages from the start of the current month in Asia/Kolkata through the scan start time. Only locally filtered, minimized transaction candidates leave the phone. The Node ingestion endpoint independently applies the same transaction-only policy before encrypted storage, and the report reader revalidates historical records again.
+- Optional Gemini SMS merchant categorization receives an audited two-field projection only: a locally hashed row ID and sanitized merchant/payee candidate. It never receives the raw/redacted SMS body, sender, amount, timestamp, phone number, account/card data, UPI ID, or payment reference.
 - The final completion checkpoint contains scan identifiers, time bounds, and message counts only; it contains no personal SMS body.
 - Unchecking consent cancels scheduled work. Also revoke SMS permissions from **Android Settings > Apps > SMS Budget Companion > Permissions** when retiring the app.
 - Rooted devices, hostile accessibility services, or a compromised HTTPS endpoint can defeat these protections; use this only on devices and infrastructure you control.
@@ -135,7 +142,7 @@ SMS permissions are hard-restricted by Google Play. A normal Play Store listing 
 
 ## Tests
 
-`TransactionSmsFilterTest` covers debits, UPI payments, refunds, amount requirements, order-only rejection, OTP and verification rejection, promotions, failed/pending transactions, balances, due notices, card-bill confirmations, self-transfers, ordinary messages, and identifier redaction. `HmacUploadClientTest` pins the HMAC format to the Node ingestion implementation. `SmsPayloadBuilderTest` verifies schema version 2, full-scan metadata, IST month boundaries, the 100-message batch ceiling, and the mandatory empty completion checkpoint (including a zero-candidate scan).
+`TransactionSmsFilterTest` covers debits, UPI payments, refunds, amount/completion requirements, personal-sender rejection, order-only rejection, OTP and verification rejection, promotions, requests and failed/pending transactions, balances, due notices, card-bill confirmations, self-transfers, ordinary messages, minimization, and identifier redaction. `HmacUploadClientTest` pins the HMAC format to the Node ingestion implementation. `SmsPayloadBuilderTest` verifies schema version 2, full-scan metadata, IST month boundaries, the 100-message batch ceiling, and the mandatory empty completion checkpoint (including a zero-candidate scan).
 
 The filter and HMAC tests can run without an Android SDK through the small JVM verification build:
 
