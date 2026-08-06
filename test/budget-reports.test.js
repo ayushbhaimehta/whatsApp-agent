@@ -27,6 +27,7 @@ const {
     attachSwiggyOrdersToTransactions,
     summarizeBudget,
     formatBudgetWhatsApp,
+    renderBudgetHtml,
     collectAndroidSmsTransactions,
     generateMonthlyBudgetReport
 } = require('../budget-reports');
@@ -111,6 +112,15 @@ test('reserves Ayush Mehta variants for Ayush transfers without matching near na
     );
 });
 
+test('maps Tata Payments to the reserved credit card payment category', () => {
+    assert.deepEqual(
+        identifyMerchant('INR 25,000 paid to TATA PAYMENTS'),
+        { merchant: 'Tata Payments', channelCategory: 'credit_card_payment' }
+    );
+    assert.equal(VALID_CHANNEL_CATEGORIES.has('credit_card_payment'), true);
+    assert.equal(GEMINI_MERCHANT_CATEGORIES.has('credit_card_payment'), false);
+});
+
 test('extracts merchants from recurring bank and payment-gateway templates', () => {
     assert.deepEqual(
         identifyMerchant('Sent Rs.500 From HDFC Bank A/C XX123 To JOHN DOE On 29/Jul/2026'),
@@ -144,8 +154,8 @@ test('uses safe merchant-name fallbacks when Gemini is unavailable', () => {
     assert.equal(classifyMerchantNameFallback('Arliga Ecoworld Business', 'transfer'), 'miscellaneous');
 });
 
-test('keeps known opaque legal merchants in Miscellaneous instead of over-interpreting them', () => {
-    for (const merchant of ['TATA PAYMENTS L', 'GOZO VENTURES', 'ARLIGA ECOWORLD BUSINESS']) {
+test('keeps other known opaque legal merchants in Miscellaneous instead of over-interpreting them', () => {
+    for (const merchant of ['GOZO VENTURES', 'ARLIGA ECOWORLD BUSINESS']) {
         const transaction = createTransaction({
             provider: 'android_sms',
             externalId: `opaque-${merchant}`,
@@ -611,7 +621,7 @@ test('receipt enrichment cannot assign reserved categories or bypass a locked me
         ]
     });
     assert.equal(results[0].channelCategory, 'miscellaneous');
-    assert.equal(results[1].channelCategory, 'miscellaneous');
+    assert.equal(results[1].channelCategory, 'credit_card_payment');
 
     const forexAttempt = applyBudgetEnrichment([unresolved], {
         transactions: [{ id: unresolved.id, merchant: 'Unrecognized', channel_category: 'forex', items: [] }]
@@ -654,6 +664,38 @@ test('summarizes debits and refunds using integer paise', () => {
     assert.equal(summary.refundsPaise, 2005);
     assert.equal(summary.netPaise, 8005);
     assert.equal(summary.remainingPaise, 11995);
+});
+
+test('shows Ayush transfers and Tata card payments separately without counting them as expenses', () => {
+    const expense = createTransaction({ provider: 'android_sms', externalId: 'expense', occurredAt: '2026-07-12', text: 'INR 450 paid to Zomato', sourceType: 'sms' });
+    const ayushTransfer = createTransaction({ provider: 'android_sms', externalId: 'ayush', occurredAt: '2026-07-13', text: 'INR 1000 sent to Ayush Mehta', sourceType: 'sms' });
+    const cardPayment = createTransaction({ provider: 'android_sms', externalId: 'card', occurredAt: '2026-07-14', text: 'INR 25000 paid to Tata Payments', sourceType: 'sms' });
+    const summary = summarizeBudget([expense, ayushTransfer, cardPayment], 5000000);
+
+    assert.equal(summary.debitsPaise, 45000);
+    assert.equal(summary.netPaise, 45000);
+    assert.equal(summary.remainingPaise, 4955000);
+    assert.equal(summary.transactionCount, 1);
+    assert.equal(summary.totalTransactionCount, 3);
+    assert.equal(summary.excludedTransactionCount, 2);
+    assert.equal(summary.excludedNetPaise, 2600000);
+    assert.deepEqual(summary.byChannel, [{ key: 'online_food', amountPaise: 45000 }]);
+    assert.deepEqual(summary.excludedByChannel, [
+        { key: 'credit_card_payment', amountPaise: 2500000 },
+        { key: 'ayush_transfers', amountPaise: 100000 }
+    ]);
+
+    const report = {
+        label: 'July 2026',
+        generatedAt: '2026-07-31T18:30:00.000Z',
+        summary,
+        sourceCounts: { android_sms: 3 },
+        warnings: [],
+        transactions: [expense, ayushTransfer, cardPayment]
+    };
+    assert.match(formatBudgetWhatsApp(report), /excluded from budget spend/i);
+    assert.match(formatBudgetWhatsApp(report), /Credit card payment/);
+    assert.match(renderBudgetHtml(report), /Excluded money movements/);
 });
 
 test('reports missing itemization honestly instead of allocating payment totals', () => {

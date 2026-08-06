@@ -36,6 +36,7 @@ const CHANNEL_LABELS = {
     services: 'Services',
     financial_services: 'Financial services',
     ayush_transfers: 'Ayush transfers',
+    credit_card_payment: 'Credit card payment',
     transfer: 'Transfers',
     forex: 'Forex',
     miscellaneous: 'Miscellaneous'
@@ -89,7 +90,8 @@ const LEGACY_ITEM_CATEGORY_ALIASES = {
 const BUDGET_CATEGORY_RULE_SCHEMA_VERSION = 1;
 const MAX_BUDGET_CATEGORY_RULES_PER_MONTH = 24;
 const MAX_BUDGET_RULE_PROPOSALS_PER_REQUEST = 8;
-const RESERVED_BUDGET_RULE_CATEGORIES = new Set(['ayush_transfers', 'forex']);
+const RESERVED_BUDGET_RULE_CATEGORIES = new Set(['ayush_transfers', 'credit_card_payment', 'forex']);
+const NON_EXPENSE_CHANNEL_CATEGORIES = new Set(['ayush_transfers', 'credit_card_payment']);
 const BUDGET_RULE_MERCHANT_TYPES = new Set([
     'food_business',
     'person_transfer',
@@ -198,7 +200,7 @@ const MERCHANT_RULES = [
     { pattern: /\belite\s+mindset\b|\bsuper\s*you\b/i, merchant: 'SuperYou', category: 'health' },
     { pattern: /\bindian\s+motors?\b/i, merchant: 'Indian Motors', category: 'transport' },
     { pattern: /\bteach\s+to\s+lead\b|\bteach\s+for\s+india\b/i, merchant: 'Teach For India', category: 'donations' },
-    { pattern: /\btata\s+payments?\b/i, merchant: 'Tata Payments', category: 'miscellaneous' },
+    { pattern: /\btata\s+payments?\b/i, merchant: 'Tata Payments', category: 'credit_card_payment' },
     { pattern: /\bgozo\s+ventures?\b/i, merchant: 'Gozo Ventures', category: 'miscellaneous' },
     { pattern: /\barliga\s+ecoworld\s+business\b/i, merchant: 'Arliga Ecoworld Business', category: 'miscellaneous' },
     { pattern: /\buber\b|\bola\b|\brapido\b|\b(?:petrol|diesel|fuel)\b/i, merchant: null, category: 'transport' },
@@ -1749,14 +1751,18 @@ function aggregateBy(transactions, keySelector) {
 }
 
 function summarizeBudget(transactions, monthlyBudgetPaise = null) {
-    const debitsPaise = transactions.filter(item => item.direction === 'debit').reduce((sum, item) => sum + item.amountPaise, 0);
-    const refundsPaise = transactions.filter(item => item.direction === 'refund').reduce((sum, item) => sum + item.amountPaise, 0);
+    const expenseTransactions = transactions.filter(item => !NON_EXPENSE_CHANNEL_CATEGORIES.has(canonicalChannelCategory(item.channelCategory)));
+    const excludedTransactions = transactions.filter(item => NON_EXPENSE_CHANNEL_CATEGORIES.has(canonicalChannelCategory(item.channelCategory)));
+    const debitsPaise = expenseTransactions.filter(item => item.direction === 'debit').reduce((sum, item) => sum + item.amountPaise, 0);
+    const refundsPaise = expenseTransactions.filter(item => item.direction === 'refund').reduce((sum, item) => sum + item.amountPaise, 0);
     const netPaise = debitsPaise - refundsPaise;
+    const excludedDebitsPaise = excludedTransactions.filter(item => item.direction === 'debit').reduce((sum, item) => sum + item.amountPaise, 0);
+    const excludedRefundsPaise = excludedTransactions.filter(item => item.direction === 'refund').reduce((sum, item) => sum + item.amountPaise, 0);
     const duplicateRecordsMerged = transactions.reduce((sum, transaction) => sum + (transaction.duplicateCount || 0), 0);
     const itemTotals = new Map();
     let itemizedLinePaise = 0;
     let itemCount = 0;
-    for (const transaction of transactions) {
+    for (const transaction of expenseTransactions) {
         if (transaction.direction !== 'debit') continue;
         for (const item of transaction.items || []) {
             itemCount += 1;
@@ -1771,15 +1777,21 @@ function summarizeBudget(transactions, monthlyBudgetPaise = null) {
         }
     }
     return {
-        transactionCount: transactions.length,
+        transactionCount: expenseTransactions.length,
+        totalTransactionCount: transactions.length,
+        excludedTransactionCount: excludedTransactions.length,
         duplicateRecordsMerged,
         debitsPaise,
         refundsPaise,
         netPaise,
+        excludedDebitsPaise,
+        excludedRefundsPaise,
+        excludedNetPaise: excludedDebitsPaise - excludedRefundsPaise,
         monthlyBudgetPaise,
         remainingPaise: monthlyBudgetPaise == null ? null : monthlyBudgetPaise - netPaise,
-        byChannel: aggregateBy(transactions, transaction => canonicalChannelCategory(transaction.channelCategory)),
-        byMerchant: aggregateBy(transactions, transaction => transaction.merchant),
+        byChannel: aggregateBy(expenseTransactions, transaction => canonicalChannelCategory(transaction.channelCategory)),
+        excludedByChannel: aggregateBy(excludedTransactions, transaction => canonicalChannelCategory(transaction.channelCategory)),
+        byMerchant: aggregateBy(expenseTransactions, transaction => transaction.merchant),
         byItemCategory: [...itemTotals.entries()].map(([key, value]) => ({ key, ...value })).sort((a, b) => b.amountPaise - a.amountPaise || b.count - a.count),
         itemizedLinePaise,
         itemCount
@@ -1802,7 +1814,7 @@ function formatBudgetWhatsApp(report) {
         '',
         `*Net spend:* ${formatInr(summary.netPaise)}`,
         `Debits: ${formatInr(summary.debitsPaise)} | Refunds: ${formatInr(summary.refundsPaise)}`,
-        `Transactions: ${summary.transactionCount}`,
+        `Expense transactions: ${summary.transactionCount}`,
         `Duplicate alerts merged: ${summary.duplicateRecordsMerged || 0}`
     ];
 
@@ -1814,6 +1826,13 @@ function formatBudgetWhatsApp(report) {
     if (summary.byChannel.length > 0) {
         lines.push('', '*By channel*');
         for (const entry of summary.byChannel.slice(0, 8)) {
+            lines.push(`• ${budgetChannelLabel(report, entry.key)}: ${formatInr(entry.amountPaise)}`);
+        }
+    }
+
+    if (summary.excludedByChannel?.length > 0) {
+        lines.push('', '*Shown separately — excluded from budget spend*');
+        for (const entry of summary.excludedByChannel) {
             lines.push(`• ${budgetChannelLabel(report, entry.key)}: ${formatInr(entry.amountPaise)}`);
         }
     }
@@ -1887,6 +1906,10 @@ function renderBudgetHtml(report) {
         return `<tr><td>${escapeHtml(new Date(transaction.occurredAt).toLocaleString('en-IN', { timeZone: TIME_ZONE }))}</td><td>${escapeHtml(transaction.merchant)}</td><td>${escapeHtml(budgetChannelLabel(report, transaction.channelCategory))}</td><td>${escapeHtml(transaction.direction)}</td><td class="amount">${escapeHtml(formatInr(transaction.amountPaise))}</td><td>${items}</td><td>${escapeHtml(transaction.sources.join(', '))}${itemSources}${dedupe}</td></tr>`;
     }).join('');
     const categoryRows = report.summary.byChannel.map(entry => `<tr><td>${escapeHtml(budgetChannelLabel(report, entry.key))}</td><td class="amount">${escapeHtml(formatInr(entry.amountPaise))}</td></tr>`).join('');
+    const excludedCategoryRows = (report.summary.excludedByChannel || []).map(entry => `<tr><td>${escapeHtml(budgetChannelLabel(report, entry.key))}</td><td class="amount">${escapeHtml(formatInr(entry.amountPaise))}</td></tr>`).join('');
+    const excludedSection = excludedCategoryRows
+        ? `<section><h2>Excluded money movements</h2><p class="muted">Shown for visibility but not included in debits, net spend, or the remaining monthly budget.</p><table><thead><tr><th>Category</th><th class="amount">Net amount</th></tr></thead><tbody>${excludedCategoryRows}</tbody></table></section>`
+        : '';
     const itemCategoryRows = report.summary.byItemCategory.map(entry => `<tr><td>${escapeHtml(ITEM_LABELS[entry.key] || entry.key)}</td><td>${escapeHtml(entry.count)}</td><td class="amount">${entry.amountPaise > 0 ? escapeHtml(formatInr(entry.amountPaise)) : '<span class="muted">No explicit line value</span>'}</td></tr>`).join('');
     const smsCoverage = report.smsCoverage?.complete
         ? `<section><h2>SMS coverage</h2><p>${escapeHtml(report.smsCoverage.inboxMessageCount)} inbox messages scanned through ${escapeHtml(new Date(report.smsCoverage.scannedThrough).toLocaleString('en-IN', { timeZone: TIME_ZONE }))}; ${escapeHtml(report.smsCoverage.transactionCandidateCount)} financial transaction alerts selected.</p></section>`
@@ -1901,9 +1924,9 @@ function renderBudgetHtml(report) {
         if (rule.currentCategories?.length) selectors.push(`Prior categories: ${rule.currentCategories.map(value => budgetChannelLabel(report, value)).join(', ')}`);
         return `<tr><td>${escapeHtml(rule.categoryLabel)}</td><td>${escapeHtml(selectors.join(' · '))}</td><td>${escapeHtml(rule.matchedTransactionCount || 0)}</td></tr>`;
     }).join('');
-    const categoryRulesSection = categoryRuleRows
+    const categoryRulesSection = (categoryRuleRows
         ? `<section><h2>Custom category rules</h2><p class="muted">Month-specific rules are applied after source reconciliation. Monetary amounts are never changed.</p><table><thead><tr><th>Result category</th><th>Bounded selectors</th><th>Matched transactions</th></tr></thead><tbody>${categoryRuleRows}</tbody></table></section>`
-        : '';
+        : '') + excludedSection;
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Monthly Budget Report — ${escapeHtml(report.label)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:32px;color:#1f2937;background:#f8fafc}main{max-width:1200px;margin:auto}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card,section{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:18px;margin:16px 0}.value{font-size:1.7rem;font-weight:700;color:#0f766e}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:top}.amount{white-space:nowrap;text-align:right}.muted,.notes{color:#64748b}ul{margin:0;padding-left:20px}@media(max-width:720px){body{margin:12px}table{font-size:12px}}</style></head><body><main><h1>Monthly Budget Report</h1><p class="muted">${escapeHtml(report.label)} · Generated ${escapeHtml(new Date(report.generatedAt).toLocaleString('en-IN', { timeZone: TIME_ZONE }))}</p><div class="cards"><div class="card"><div>Net spend</div><div class="value">${escapeHtml(formatInr(report.summary.netPaise))}</div></div><div class="card"><div>Debits</div><div class="value">${escapeHtml(formatInr(report.summary.debitsPaise))}</div></div><div class="card"><div>Refunds</div><div class="value">${escapeHtml(formatInr(report.summary.refundsPaise))}</div></div><div class="card"><div>Transactions</div><div class="value">${report.summary.transactionCount}</div></div><div class="card"><div>Duplicate alerts merged</div><div class="value">${report.summary.duplicateRecordsMerged || 0}</div></div></div>${smsCoverage}${swiggyCoverage}${categoryRulesSection}<section><h2>Channel totals</h2><table><thead><tr><th>Category</th><th class="amount">Amount</th></tr></thead><tbody>${categoryRows || '<tr><td colspan="2">No transactions found.</td></tr>'}</tbody></table></section><section><h2>Item-category totals</h2><p class="muted">Only explicit item prices are totaled; the bank payment remains the financial source of truth.</p><table><thead><tr><th>Category</th><th>Items</th><th class="amount">Explicit line value</th></tr></thead><tbody>${itemCategoryRows || '<tr><td colspan="3">No itemized order or receipt data was available.</td></tr>'}</tbody></table></section><section><h2>Transactions and item categories</h2><table><thead><tr><th>Date</th><th>Merchant</th><th>Channel</th><th>Direction</th><th class="amount">Amount</th><th>Order / receipt items</th><th>Sources / duplicate matching</th></tr></thead><tbody>${transactionRows || '<tr><td colspan="7">No matching transactions found.</td></tr>'}</tbody></table></section>${report.warnings.length ? `<section class="notes"><h2>Coverage notes</h2><ul>${report.warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></section>` : ''}</main></body></html>`;
 }
 

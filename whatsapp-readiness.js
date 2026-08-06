@@ -92,6 +92,7 @@ function createWhatsAppReadinessWatchdog({
     let lastSnapshot = null;
     let checking = false;
     let recoveryAttempts = 0;
+    let authenticatedObserved = false;
     let stopped = false;
     let stallReported = false;
 
@@ -119,7 +120,8 @@ function createWhatsAppReadinessWatchdog({
             elapsedMs: firstSignalAt === null ? 0 : Math.max(0, now() - firstSignalAt),
             lastSignal,
             snapshot: lastSnapshot,
-            recoveryAttempts
+            recoveryAttempts,
+            authenticatedObserved
         });
     }
 
@@ -148,7 +150,10 @@ function createWhatsAppReadinessWatchdog({
                 !isReady()
                 && lastSnapshot?.pageAvailable
                 && lastSnapshot.documentReadyState === 'complete'
-                && lastSnapshot.hasSynced
+                // The authenticated event itself is raised from WhatsApp's
+                // app-state-synced callback. Some current web builds emit it
+                // but no longer expose Socket.hasSynced consistently.
+                && (lastSnapshot.hasSynced || authenticatedObserved)
                 && !lastSnapshot.wwebjsInjected
                 && recoveryAttempts < maxRecoveryAttempts
             ) {
@@ -170,6 +175,7 @@ function createWhatsAppReadinessWatchdog({
     }
 
     function noteAuthenticated() {
+        authenticatedObserved = true;
         arm('authenticated');
     }
 
@@ -192,6 +198,7 @@ function createWhatsAppReadinessWatchdog({
         lastSnapshot = null;
         checking = false;
         recoveryAttempts = 0;
+        authenticatedObserved = false;
         stopped = false;
         stallReported = false;
     }
@@ -206,6 +213,7 @@ function createWhatsAppReadinessWatchdog({
             lastSignal,
             lastSnapshot,
             recoveryAttempts,
+            authenticatedObserved,
             probeScheduled: probeTimer !== null,
             stallScheduled: stallTimer !== null
         };

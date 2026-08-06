@@ -96,6 +96,31 @@ test('runs a bounded full reinjection when the synchronized event layer is absen
     assert.equal(watchdog.getState().recoveryAttempts, 1);
 });
 
+test('authenticated event permits recovery when a new web build hides hasSynced', async () => {
+    let recoveries = 0;
+    const watchdog = createWhatsAppReadinessWatchdog({
+        isReady: () => false,
+        inspect: async () => ({
+            pageAvailable: true,
+            documentReadyState: 'complete',
+            socketState: 'CONNECTED',
+            hasSynced: false,
+            wwebjsInjected: false
+        }),
+        recover: async () => { recoveries += 1; },
+        maxRecoveryAttempts: 1,
+        setTimer: () => 1,
+        clearTimer: () => {},
+        logger: quietLogger
+    });
+
+    watchdog.noteAuthenticated();
+    await watchdog.checkNow();
+
+    assert.equal(recoveries, 1);
+    assert.equal(watchdog.getState().authenticatedObserved, true);
+});
+
 test('95-to-100-percent loading arms the watchdog', () => {
     const watchdog = createWhatsAppReadinessWatchdog({
         setTimer: () => 1,

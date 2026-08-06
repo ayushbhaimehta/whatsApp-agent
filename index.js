@@ -245,7 +245,8 @@ const whatsappReadinessWatchdog = createWhatsAppReadinessWatchdog({
             documentReadyState: snapshot.documentReadyState || null,
             wwebjsInjected: Boolean(snapshot.wwebjsInjected),
             webVersion: snapshot.webVersion || null,
-            recoveryAttempts: Number(details?.recoveryAttempts || 0)
+            recoveryAttempts: Number(details?.recoveryAttempts || 0),
+            authenticatedObserved: Boolean(details?.authenticatedObserved)
         };
         console.error(
             'WhatsApp authenticated but did not become ready before the safety timeout. ' +

@@ -983,6 +983,8 @@ Examples:
 | Swiggy, Zomato, Ownly, EatClub payment | `Online food` |
 | Zepto, Instamart, Blinkit, BigBasket, Flipkart Minutes payment | `Online delivery` |
 | Bottle Lab payment | `Office cafeteria` |
+| Ayush Mehta transfer | `Ayush transfers`; shown separately and excluded from budget spend |
+| Tata Payments payment | `Credit card payment`; shown separately and excluded to prevent counting the card bill twice |
 | A person's name | `Transfers`, unless a safer deterministic merchant rule applies |
 | Foreign-currency posting with INR debit evidence | `Forex` |
 | Poha item | Its own `Poha` item category |
