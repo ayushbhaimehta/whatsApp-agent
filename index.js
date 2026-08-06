@@ -205,6 +205,13 @@ const whatsappReadinessWatchdog = createWhatsAppReadinessWatchdog({
     client,
     isReady: () => clientIsReady,
     stallTimeoutMs: whatsappReadyTimeoutMs,
+    recover: async () => {
+        // The pinned upstream client makes inject() restart-safe: it cancels
+        // stale frame work, de-duplicates browser listeners, loads WWebJS, and
+        // attaches message events before emitting the real ready event.
+        await client.inject();
+        return true;
+    },
     onStalled: async details => {
         const snapshot = details?.snapshot || {};
         const diagnostic = {
@@ -212,7 +219,9 @@ const whatsappReadinessWatchdog = createWhatsAppReadinessWatchdog({
             socketState: snapshot.socketState || null,
             hasSynced: Boolean(snapshot.hasSynced),
             documentReadyState: snapshot.documentReadyState || null,
-            wwebjsInjected: Boolean(snapshot.wwebjsInjected)
+            wwebjsInjected: Boolean(snapshot.wwebjsInjected),
+            webVersion: snapshot.webVersion || null,
+            recoveryAttempts: Number(details?.recoveryAttempts || 0)
         };
         console.error(
             'WhatsApp authenticated but did not become ready before the safety timeout. ' +

@@ -21,7 +21,8 @@ test('reports an unavailable Puppeteer page without throwing', async () => {
         socketState: null,
         hasSynced: false,
         callbackAvailable: false,
-        wwebjsInjected: false
+        wwebjsInjected: false,
+        webVersion: null
     });
 });
 
@@ -41,6 +42,32 @@ test('authentication arms read-only diagnostics without synthesizing ready', asy
 
     assert.equal(probes, 1);
     assert.equal(watchdog.getState().armed, true);
+});
+
+test('runs a bounded full reinjection when the synchronized event layer is absent', async () => {
+    let recoveries = 0;
+    const watchdog = createWhatsAppReadinessWatchdog({
+        isReady: () => false,
+        inspect: async () => ({
+            pageAvailable: true,
+            documentReadyState: 'complete',
+            socketState: 'CONNECTED',
+            hasSynced: true,
+            wwebjsInjected: false
+        }),
+        recover: async () => { recoveries += 1; },
+        maxRecoveryAttempts: 1,
+        setTimer: () => 1,
+        clearTimer: () => {},
+        logger: quietLogger
+    });
+
+    watchdog.noteAuthenticated();
+    await watchdog.checkNow();
+    await watchdog.checkNow();
+
+    assert.equal(recoveries, 1);
+    assert.equal(watchdog.getState().recoveryAttempts, 1);
 });
 
 test('95-to-100-percent loading arms the watchdog', () => {

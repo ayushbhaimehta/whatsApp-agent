@@ -14,7 +14,8 @@ async function inspectWhatsAppReadiness(client) {
             socketState: null,
             hasSynced: false,
             callbackAvailable: false,
-            wwebjsInjected: false
+            wwebjsInjected: false,
+            webVersion: null
         };
     }
 
@@ -25,7 +26,8 @@ async function inspectWhatsAppReadiness(client) {
             socketState: null,
             hasSynced: false,
             callbackAvailable: typeof window.onAppStateHasSyncedEvent === 'function',
-            wwebjsInjected: typeof window.WWebJS !== 'undefined'
+            wwebjsInjected: typeof window.WWebJS !== 'undefined',
+            webVersion: window.Debug?.VERSION || null
         };
 
         try {
@@ -49,18 +51,21 @@ function normalizePercent(percent) {
 
 /**
  * Bound an authenticated-but-not-ready startup. The pinned whatsapp-web.js
- * dependency owns synchronization and listener injection. This watchdog only
- * records state and asks the process owner to restart after a hard timeout.
+ * dependency owns synchronization and listener injection. This watchdog can
+ * request its full, restart-safe injection after the page becomes stable; it
+ * never emits or fabricates a ready event itself.
  */
 function createWhatsAppReadinessWatchdog({
     client,
     isReady = () => false,
     inspect = () => inspectWhatsAppReadiness(client),
+    recover = async () => false,
     onStalled = async () => {},
     onProbe = () => {},
     logger = console,
     probeIntervalMs = 15000,
     stallTimeoutMs = 120000,
+    maxRecoveryAttempts = 2,
     now = () => Date.now(),
     setTimer = setTimeout,
     clearTimer = clearTimeout
@@ -71,6 +76,7 @@ function createWhatsAppReadinessWatchdog({
     let lastSignal = null;
     let lastSnapshot = null;
     let checking = false;
+    let recoveryAttempts = 0;
     let stopped = false;
     let stallReported = false;
 
@@ -97,7 +103,8 @@ function createWhatsAppReadinessWatchdog({
             reason: 'ready_timeout',
             elapsedMs: firstSignalAt === null ? 0 : Math.max(0, now() - firstSignalAt),
             lastSignal,
-            snapshot: lastSnapshot
+            snapshot: lastSnapshot,
+            recoveryAttempts
         });
     }
 
@@ -121,6 +128,25 @@ function createWhatsAppReadinessWatchdog({
                 onProbe(lastSnapshot);
             } catch (error) {
                 logger.warn?.('Could not inspect WhatsApp synchronization state:', error?.message || error);
+            }
+            if (
+                !isReady()
+                && lastSnapshot?.pageAvailable
+                && lastSnapshot.documentReadyState === 'complete'
+                && lastSnapshot.hasSynced
+                && !lastSnapshot.wwebjsInjected
+                && recoveryAttempts < maxRecoveryAttempts
+            ) {
+                recoveryAttempts += 1;
+                logger.warn?.(
+                    `WhatsApp Web is synchronized but its event layer is missing; ` +
+                    `running full reinjection ${recoveryAttempts}/${maxRecoveryAttempts}.`
+                );
+                try {
+                    await recover({ attempt: recoveryAttempts, snapshot: lastSnapshot });
+                } catch (error) {
+                    logger.error?.('WhatsApp Web reinjection failed:', error?.stack || error?.message || error);
+                }
             }
             if (!isReady()) scheduleProbe();
         } finally {
@@ -150,6 +176,7 @@ function createWhatsAppReadinessWatchdog({
         lastSignal = null;
         lastSnapshot = null;
         checking = false;
+        recoveryAttempts = 0;
         stopped = false;
         stallReported = false;
     }
@@ -163,6 +190,7 @@ function createWhatsAppReadinessWatchdog({
             firstSignalAt,
             lastSignal,
             lastSnapshot,
+            recoveryAttempts,
             probeScheduled: probeTimer !== null,
             stallScheduled: stallTimer !== null
         };
