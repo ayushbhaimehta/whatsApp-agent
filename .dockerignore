@@ -1,0 +1,35 @@
+.git
+.gitignore
+.github
+
+node_modules
+__pycache__
+*.py[cod]
+
+# Never copy credentials or private runtime state into an image layer.
+.env
+.env.*
+!.env.example
+!.env.cloud.example
+service-account.json
+google-tasks-token.json
+google-budget-token.json
+swiggy-mcp-auth
+swiggy-orders.enc.json
+.wwebjs_auth
+.wwebjs_cache
+cloud-data
+
+# Generated/private data.
+*.log
+.agent-status.json
+.whatsapp-qr.png
+reports
+budget-reports
+budget-data
+budget_*.html
+budget_*.json
+
+# The Android application is unrelated to the server image.
+android-sms-companion
+*.apk

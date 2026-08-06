@@ -1,12 +1,10 @@
 const crypto = require('crypto');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const { getAgentDataDirectory } = require('./runtime-paths');
 require('dotenv').config();
 
-const privateRoot = process.env.LOCALAPPDATA
-    ? path.join(process.env.LOCALAPPDATA, 'WhatsAppFoodAgent')
-    : path.join(os.homedir(), '.whatsapp-food-agent');
+const privateRoot = getAgentDataDirectory();
 const secretPath = process.env.SMS_INGESTION_SECRET_FILE || path.join(privateRoot, 'secrets', 'sms-ingestion-secret.txt');
 
 fs.mkdirSync(path.dirname(secretPath), { recursive: true });

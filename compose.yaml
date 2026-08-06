@@ -1,0 +1,45 @@
+services:
+  agent:
+    build:
+      context: .
+    restart: unless-stopped
+
+    # Linux host networking lets Tailscale Serve and SSH tunnels reach the SMS
+    # API and OAuth callbacks. Keep every non-SSH port closed in the Oracle
+    # firewall: mcp-remote may briefly bind its Swiggy callback ports broadly.
+    network_mode: host
+    env_file:
+      - .env.cloud
+    environment:
+      TZ: Asia/Kolkata
+      AGENT_DATA_DIR: /data
+      WHATSAPP_AUTH_PATH: /data/whatsapp-auth
+      WHATSAPP_BROWSER_EXECUTABLE: /usr/bin/chromium
+      GOOGLE_APPLICATION_CREDENTIALS: /data/secrets/service-account.json
+      GOOGLE_TASKS_TOKEN_PATH: /data/secrets/google-tasks-token.json
+      BUDGET_GMAIL_TOKEN_PATH: /data/secrets/google-budget-token.json
+      SMS_INGESTION_SECRET_FILE: /data/secrets/sms-ingestion-secret.txt
+      SMS_TRANSACTION_STORE: /data/budget-data/android-sms.enc.jsonl
+      SMS_SCAN_STATE_PATH: /data/budget-data/android-sms-scan-state.json
+      BUDGET_SCHEDULE_STATE_PATH: /data/budget-data/monthly-schedule-state.json
+      BUDGET_REPORTS_DIR: /data/budget-reports
+      SWIGGY_MCP_AUTH_DIR: /data/secrets/swiggy-mcp-auth
+      SWIGGY_ORDER_CACHE_PATH: /data/budget-data/swiggy-orders.enc.json
+      STOCK_REPORTS_DIR: /data/stock-reports
+      WHATSAPP_AUDIT_LOG_PATH: /data/logs/chat-events.log
+      AGENT_STATUS_PATH: /data/status/agent-status.json
+      WHATSAPP_QR_PATH: /data/status/whatsapp-qr.png
+      PYTHON_EXECUTABLE: /opt/venv/bin/python
+      SWIGGY_INSTAMART_CALLBACK_PORT: "16148"
+      SWIGGY_FOOD_CALLBACK_PORT: "21621"
+    volumes:
+      - ./cloud-data:/data
+    shm_size: 1gb
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

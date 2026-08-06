@@ -106,10 +106,21 @@ test('keeps Gemini summary and suggestion intents private-chat-only', () => {
 
 test('keeps Gemini monthly budget intent private-chat-only and preserves period', () => {
     const budget = { intent: 'monthly_budget', period: '2026-07', items: [] };
-    assert.deepEqual(resolveGeminiAction({ result: budget, isCookChat: false, isPrivateChat: true }), {
+    assert.deepEqual(resolveGeminiAction({
+        result: budget,
+        isCookChat: false,
+        isPrivateChat: true,
+        canAccessBudget: true
+    }), {
         action: 'monthly_budget',
         period: '2026-07'
     });
+    assert.equal(resolveGeminiAction({
+        result: budget,
+        isCookChat: false,
+        isPrivateChat: true,
+        canAccessBudget: false
+    }).action, 'ignore');
     assert.equal(resolveGeminiAction({ result: budget, isCookChat: true, isPrivateChat: false }).action, 'ignore');
 });
 

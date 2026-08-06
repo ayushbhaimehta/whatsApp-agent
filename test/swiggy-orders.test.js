@@ -8,11 +8,23 @@ const {
     SWIGGY_ENDPOINTS,
     assertAllowedSwiggyTool,
     authorizeSwiggy,
+    getConfiguredCallbackPort,
     hasSwiggyAuthState,
     loadSwiggyOrderCache,
     syncSwiggyOrderCache,
     filterSwiggyOrdersForWindow
 } = require('../swiggy-orders');
+
+test('uses stable provider-specific OAuth callback ports only when configured', () => {
+    const env = {
+        SWIGGY_INSTAMART_CALLBACK_PORT: '16148',
+        SWIGGY_FOOD_CALLBACK_PORT: '21621'
+    };
+    assert.equal(getConfiguredCallbackPort('swiggy_instamart', env), 16148);
+    assert.equal(getConfiguredCallbackPort('swiggy_food', env), 21621);
+    assert.equal(getConfiguredCallbackPort('swiggy_food', { SWIGGY_FOOD_CALLBACK_PORT: '80' }), null);
+    assert.equal(getConfiguredCallbackPort('swiggy_instamart', {}), null);
+});
 
 function result(payload, useText = false) {
     return useText

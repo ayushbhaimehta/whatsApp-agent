@@ -3,15 +3,18 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { google } = require('googleapis');
+const { getAgentDataDirectory, resolveRuntimePath } = require('./runtime-paths');
 require('dotenv').config();
 
 const PORT = Number(process.env.BUDGET_OAUTH_PORT || 3001);
 const REDIRECT_URI = `http://localhost:${PORT}/oauth2callback`;
-const PRIVATE_DATA_ROOT = process.env.LOCALAPPDATA
-    ? path.join(process.env.LOCALAPPDATA, 'WhatsAppFoodAgent')
-    : path.join(require('os').homedir(), '.whatsapp-food-agent');
+const PRIVATE_DATA_ROOT = getAgentDataDirectory();
 const TOKEN_PATH = process.env.BUDGET_GMAIL_TOKEN_PATH || path.join(PRIVATE_DATA_ROOT, 'google-budget-token.json');
-const TASKS_TOKEN_PATH = path.join(__dirname, 'google-tasks-token.json');
+const TASKS_TOKEN_PATH = resolveRuntimePath({
+    envKey: 'GOOGLE_TASKS_TOKEN_PATH',
+    relativeSegments: ['secrets', 'google-tasks-token.json'],
+    legacyPath: path.join(__dirname, 'google-tasks-token.json')
+});
 
 function loadClientCredentials() {
     let clientId = process.env.GOOGLE_CLIENT_ID;

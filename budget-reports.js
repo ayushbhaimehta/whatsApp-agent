@@ -1,8 +1,8 @@
 const crypto = require('crypto');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { google } = require('googleapis');
+const { getAgentDataDirectory, resolveRuntimePath } = require('./runtime-paths');
 const {
     DEFAULT_SCAN_FRESHNESS_MS,
     decryptStoredSmsRecord,
@@ -1463,7 +1463,11 @@ async function generateMonthlyBudgetReport({
     swiggyWarnings = [],
     swiggyCoverage = null,
     monthlyBudgetPaise = null,
-    outputDirectory = path.join(process.env.LOCALAPPDATA || os.homedir(), 'WhatsAppFoodAgent', 'budget-reports')
+    outputDirectory = resolveRuntimePath({
+        envKey: 'BUDGET_REPORTS_DIR',
+        relativeSegments: ['budget-reports'],
+        legacyPath: path.join(getAgentDataDirectory(), 'budget-reports')
+    })
 }) {
     const window = getMonthWindow(period, now);
     let smsCoverage = { complete: false, reason: 'not_required', scan: null };

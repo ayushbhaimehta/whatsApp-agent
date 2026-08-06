@@ -4,11 +4,17 @@ const url = require('url');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
+const { resolveRuntimePath } = require('./runtime-paths');
 require('dotenv').config();
 
 const PORT = Number(process.env.GOOGLE_TASKS_OAUTH_PORT || 3000);
 const REDIRECT_URI = `http://localhost:${PORT}/oauth2callback`;
-const TOKEN_PATH = path.join(__dirname, 'google-tasks-token.json');
+const TOKEN_PATH = resolveRuntimePath({
+    envKey: 'GOOGLE_TASKS_TOKEN_PATH',
+    relativeSegments: ['secrets', 'google-tasks-token.json'],
+    legacyPath: path.join(__dirname, 'google-tasks-token.json')
+});
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -64,10 +70,19 @@ async function main() {
         REDIRECT_URI
     );
 
+    // Bind the browser response to this one authorization attempt and use
+    // PKCE so an intercepted authorization code cannot be exchanged elsewhere.
+    const oauthState = crypto.randomBytes(32).toString('base64url');
+    const codeVerifier = crypto.randomBytes(64).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+
     // Generate authorization URL
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline', // Critical: gets refresh_token
         prompt: 'consent',       // Force consent to ensure we always get refresh_token
+        state: oauthState,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
         scope: ['https://www.googleapis.com/auth/tasks']
     });
 
@@ -76,6 +91,9 @@ async function main() {
         try {
             if (req.url.startsWith('/oauth2callback')) {
                 const q = url.parse(req.url, true).query;
+                if (q.state !== oauthState) {
+                    throw new Error('Google authorization state did not match. Please restart authorization.');
+                }
                 if (q.error) {
                     console.error(`\n❌ Authorization failed: ${q.error}`);
                     res.writeHead(400, { 'Content-Type': 'text/html' });
@@ -87,7 +105,7 @@ async function main() {
 
                 if (q.code) {
                     console.log('\n📥 Authorization code received. Exchanging code for tokens...');
-                    const { tokens } = await oauth2Client.getToken(q.code);
+                    const { tokens } = await oauth2Client.getToken({ code: q.code, codeVerifier });
                     
                     const tokenData = {
                         client_id: clientId,
@@ -95,7 +113,8 @@ async function main() {
                         tokens: tokens
                     };
 
-                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokenData, null, 2), 'utf-8');
+                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
+                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokenData, null, 2), { encoding: 'utf8', mode: 0o600 });
                     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                     res.end('<h1>Google Tasks connected</h1><p>You can close this tab. The WhatsApp agent will load the new token automatically.</p>');
                     console.log(`\n🎉 Success! Credentials & tokens saved to ${TOKEN_PATH}`);
@@ -119,7 +138,9 @@ async function main() {
         }
     });
 
-    server.listen(PORT, () => {
+    // Keep the temporary OAuth callback private. Cloud authorization reaches
+    // this loopback socket through an explicit SSH tunnel.
+    server.listen(PORT, '127.0.0.1', () => {
         console.log(`\n⚡ Temporary server listening on http://localhost:${PORT}`);
         console.log('\n🔗 Please open the following URL in your web browser to authorize the app:');
         console.log('----------------------------------------------------------------------');

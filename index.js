@@ -1,10 +1,51 @@
+require('dotenv').config();
+
 const fs = require('fs');
 const path = require('path');
-const bootStatus = status => fs.writeFileSync(
-    path.join(__dirname, '.agent-status.json'),
-    JSON.stringify({ status, updatedAt: new Date().toISOString() }, null, 2),
-    'utf8'
-);
+const {
+    findWhatsAppBrowserExecutable,
+    getAgentDataDirectory,
+    resolveRuntimePath
+} = require('./runtime-paths');
+
+const AGENT_STATUS_PATH = resolveRuntimePath({
+    envKey: 'AGENT_STATUS_PATH',
+    relativeSegments: ['.agent-status.json'],
+    legacyPath: path.join(__dirname, '.agent-status.json')
+});
+const WHATSAPP_QR_PATH = resolveRuntimePath({
+    envKey: 'WHATSAPP_QR_PATH',
+    relativeSegments: ['.whatsapp-qr.png'],
+    legacyPath: path.join(__dirname, '.whatsapp-qr.png')
+});
+const WHATSAPP_AUDIT_LOG_PATH = resolveRuntimePath({
+    envKey: 'WHATSAPP_AUDIT_LOG_PATH',
+    relativeSegments: ['chat-events.log'],
+    legacyPath: path.join(__dirname, 'chat-events.log')
+});
+const GOOGLE_TASKS_TOKEN_PATH = resolveRuntimePath({
+    envKey: 'GOOGLE_TASKS_TOKEN_PATH',
+    relativeSegments: ['secrets', 'google-tasks-token.json'],
+    legacyPath: path.join(__dirname, 'google-tasks-token.json')
+});
+const WHATSAPP_AUTH_PATH = resolveRuntimePath({
+    envKey: 'WHATSAPP_AUTH_PATH',
+    relativeSegments: ['whatsapp-auth'],
+    legacyPath: null
+});
+
+function ensureParentDirectory(filePath) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+const bootStatus = status => {
+    ensureParentDirectory(AGENT_STATUS_PATH);
+    fs.writeFileSync(
+        AGENT_STATUS_PATH,
+        JSON.stringify({ status, updatedAt: new Date().toISOString() }, null, 2),
+        'utf8'
+    );
+};
 bootStatus('loading');
 
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
@@ -45,6 +86,14 @@ const {
     markScheduledBudgetRunComplete
 } = require('./budget-schedule-state');
 const {
+    BUDGET_REPORT_DELIVERY_OPTIONS,
+    assertBudgetChatConfiguration,
+    assertBudgetDeliveryChatId,
+    getConfiguredBudgetChatId,
+    redactBudgetAuditBody,
+    resolveBudgetRequestDestination
+} = require('./budget-access-policy');
+const {
     GEMINI_MODEL_NAME,
     GEMINI_FALLBACK_MODEL_NAMES,
     getMessageCacheKey,
@@ -57,7 +106,6 @@ const {
 const { generateWithGeminiFallback } = require('./gemini-resilience');
 const { downloadVoiceMediaWithRetry } = require('./whatsapp-media');
 bootStatus('loading_dotenv');
-require('dotenv').config();
 bootStatus('initializing');
 
 // --- Initialization & State Management ---
@@ -85,8 +133,9 @@ const chatIdentityCache = new Map();
 
 function writeAgentStatus(status, details = {}) {
     try {
+        ensureParentDirectory(AGENT_STATUS_PATH);
         fs.writeFileSync(
-            path.join(__dirname, '.agent-status.json'),
+            AGENT_STATUS_PATH,
             JSON.stringify({ status, updatedAt: new Date().toISOString(), ...details }, null, 2),
             'utf8'
         );
@@ -131,17 +180,19 @@ const textModels = geminiModelNames.map(modelName => ({
     model: genAI.getGenerativeModel({ model: modelName })
 }));
 
-// 4. WhatsApp Setup (Using Brave Browser)
+// 4. WhatsApp Setup
+const whatsappBrowserExecutable = findWhatsAppBrowserExecutable();
+const whatsappPuppeteerOptions = {
+    // Reuse the saved Linked Devices session without showing a browser window.
+    // A visible session can still be requested explicitly for QR recovery.
+    headless: process.env.WHATSAPP_HEADLESS !== 'false',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    ...(whatsappBrowserExecutable ? { executablePath: whatsappBrowserExecutable } : {})
+};
 const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth(WHATSAPP_AUTH_PATH ? { dataPath: WHATSAPP_AUTH_PATH } : {}),
     authTimeoutMs: 300000,
-    puppeteer: {
-        // Reuse the saved Linked Devices session without showing a browser window.
-        // A visible session can still be requested explicitly for QR recovery.
-        headless: process.env.WHATSAPP_HEADLESS !== 'false',
-        executablePath: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
+    puppeteer: whatsappPuppeteerOptions
 });
 
 // 5. Google API Setup
@@ -154,7 +205,7 @@ const auth = new GoogleAuth({
 });
 
 // 6. Google Tasks OAuth 2.0 Setup
-const tokenPath = path.join(__dirname, 'google-tasks-token.json');
+const tokenPath = GOOGLE_TASKS_TOKEN_PATH;
 let oauth2Client = null;
 let oauthTokenFileMtimeMs = 0;
 let googleTasksAuthNeedsRenewal = false;
@@ -213,8 +264,9 @@ if (fs.existsSync(tokenPath)) {
 // --- WhatsApp Events ---
 
 client.on('qr', async (qr) => {
-    const qrPath = path.join(__dirname, '.whatsapp-qr.png');
+    const qrPath = WHATSAPP_QR_PATH;
     try {
+        ensureParentDirectory(qrPath);
         await QRCode.toFile(qrPath, qr, { width: 420, margin: 2 });
     } catch (error) {
         console.error('Could not create WhatsApp QR image:', error.message || error);
@@ -241,7 +293,7 @@ client.on('ready', async () => {
     if (clientIsReady) return;
     clientIsReady = true;
     try {
-        fs.rmSync(path.join(__dirname, '.whatsapp-qr.png'), { force: true });
+        fs.rmSync(WHATSAPP_QR_PATH, { force: true });
     } catch (error) {
         console.warn('Could not remove expired WhatsApp QR image:', error.message || error);
     }
@@ -260,6 +312,7 @@ client.on('ready', async () => {
 
     const readyDetails = {
         privateChatConfigured: Boolean(myPrivateChatId),
+        budgetPersonalChatConfigured: Boolean(getConfiguredBudgetChatId(process.env.PERSONAL_CHAT_ID)),
         stockSchedule: '0 18 * * 1-5 Asia/Kolkata',
         budgetSchedule: `${BUDGET_CRON_EXPRESSION} Asia/Kolkata`,
         swiggyOrderSync: swiggyOrderHistoryEnabled()
@@ -339,15 +392,21 @@ client.on('message_create', async (msg) => {
     if (messageCacheKey && processedMessageIds.has(messageCacheKey)) return;
 
     const cookChatId = process.env.COOK_CHAT_ID;
-    const personalChatId = process.env.PERSONAL_CHAT_ID || client.info?.wid?._serialized;
+    const configuredPersonalChatId = String(process.env.PERSONAL_CHAT_ID || '').trim();
+    const personalChatId = configuredPersonalChatId || client.info?.wid?._serialized;
 
     // --- GUARD 1 & 2: Time and Target Chat ---
     if (msg.timestamp < clientReadyTime - 10) return;
 
     // Resolve the actual conversation. For outgoing messages, msg.from is always
     // the logged-in account and must not be used to classify the destination chat.
-    const chatScope = await resolveMessageChatScope(msg, cookChatId, personalChatId);
-    const { isCookChat, isPrivateChat } = chatScope;
+    const chatScope = await resolveMessageChatScope(
+        msg,
+        cookChatId,
+        personalChatId,
+        configuredPersonalChatId
+    );
+    const { isCookChat, isPrivateChat, isConfiguredPersonalChat } = chatScope;
 
     // Log ignored chats
     if (!isCookChat && !isPrivateChat) {
@@ -390,6 +449,14 @@ client.on('message_create', async (msg) => {
             console.log(`📝 Text message read: "${inputData}"`);
         }
 
+        // Financial commands fail closed everywhere except the exact configured
+        // PERSONAL_CHAT_ID. This happens before Gemini so a cook-chat budget
+        // request cannot be reinterpreted or sent to an external model.
+        if (mimeType === 'text/plain' && !isConfiguredPersonalChat && parseMonthlyBudgetRequest(inputData)) {
+            console.warn('Blocked a monthly-budget request outside the configured PERSONAL_CHAT_ID.');
+            return;
+        }
+
         // Stock analysis is deliberately limited to your private self-chat. A
         // deterministic parser keeps normal food messages out of the long-running
         // report pipeline and accepts phrases such as "run analysis for AMD".
@@ -419,19 +486,24 @@ client.on('message_create', async (msg) => {
         try {
             result = await processWithGemini(inputData, mimeType);
         } catch (geminiError) {
-            const budgetFallback = isPrivateChat && mimeType === 'text/plain'
+            const budgetFallback = isConfiguredPersonalChat && mimeType === 'text/plain'
                 ? parseMonthlyBudgetRequest(inputData)
                 : null;
             if (!budgetFallback) throw geminiError;
             console.warn('Gemini intent analysis was unavailable; using the narrow monthly-budget phrase fallback.');
             result = { intent: 'monthly_budget', period: budgetFallback.period, items: [] };
         }
-        if (result?.intent === 'none' && isPrivateChat && mimeType === 'text/plain') {
+        if (result?.intent === 'none' && isConfiguredPersonalChat && mimeType === 'text/plain') {
             const budgetFallback = parseMonthlyBudgetRequest(inputData);
             if (budgetFallback) result = { intent: 'monthly_budget', period: budgetFallback.period, items: [] };
         }
         console.log(`🔍 Gemini intent resolved: intent="${result.intent}"`);
-        const resolvedAction = resolveGeminiAction({ result, isCookChat, isPrivateChat });
+        const resolvedAction = resolveGeminiAction({
+            result,
+            isCookChat,
+            isPrivateChat,
+            canAccessBudget: isConfiguredPersonalChat
+        });
 
         // All confirmations are delivered to the explicitly configured personal chat.
         const notificationChatId = personalChatId;
@@ -514,7 +586,14 @@ client.on('message_create', async (msg) => {
         }
         // Execute Action: MONTHLY BUDGET (private self-chat only)
         else if (resolvedAction.action === 'monthly_budget') {
-            const budgetChatId = chatScope.chatId || notificationChatId;
+            const budgetChatId = resolveBudgetRequestDestination({
+                isConfiguredPersonalChat,
+                personalChatId: configuredPersonalChatId
+            });
+            if (!budgetChatId) {
+                console.warn('Blocked monthly-budget delivery outside PERSONAL_CHAT_ID.');
+                return;
+            }
             await client.sendMessage(
                 budgetChatId,
                 `💰 *Budget report status*\n\nVerifying the complete mobile SMS scan and collecting available receipt emails for ${resolvedAction.period || 'the current month'}...`
@@ -553,7 +632,7 @@ function enqueueBudgetJob(task) {
     return queuedJob;
 }
 
-async function resolveMessageChatScope(msg, cookChatId, personalChatId) {
+async function resolveMessageChatScope(msg, cookChatId, personalChatId, configuredPersonalChatId = null) {
     let chat = null;
     try {
         chat = await msg.getChat();
@@ -594,10 +673,17 @@ async function resolveMessageChatScope(msg, cookChatId, personalChatId) {
         chatIdentityCache.set(chatId, { candidates: [...candidates], contactIsMe });
     }
 
+    const matchesCookChat = [...candidates].some(candidate => jidsMatch(candidate, cookChatId));
+    const matchesPersonalChat = [...candidates].some(candidate => jidsMatch(candidate, personalChatId));
+    const matchesConfiguredPersonalChat = Boolean(getConfiguredBudgetChatId(configuredPersonalChatId)) &&
+        !chat?.isGroup &&
+        [...candidates].some(candidate => jidsMatch(candidate, configuredPersonalChatId));
+
     return {
         chatId,
-        isCookChat: [...candidates].some(candidate => jidsMatch(candidate, cookChatId)),
-        isPrivateChat: contactIsMe || [...candidates].some(candidate => jidsMatch(candidate, personalChatId))
+        isCookChat: matchesCookChat,
+        isPrivateChat: contactIsMe || matchesPersonalChat,
+        isConfiguredPersonalChat: matchesConfiguredPersonalChat
     };
 }
 
@@ -605,7 +691,7 @@ async function auditWhatsAppMessage(msg) {
     try {
         const chat = await msg.getChat().catch(() => null);
         const chatId = chat?.id?._serialized || (msg.fromMe ? msg.to : msg.from) || null;
-        const body = String(msg.body || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+        const body = redactBudgetAuditBody(msg.body, { fromMe: Boolean(msg.fromMe) });
         const record = {
             timestamp: new Date().toISOString(),
             direction: msg.fromMe ? 'sent' : 'received',
@@ -620,8 +706,9 @@ async function auditWhatsAppMessage(msg) {
             body
         };
 
+        ensureParentDirectory(WHATSAPP_AUDIT_LOG_PATH);
         fs.appendFileSync(
-            path.join(__dirname, 'chat-events.log'),
+            WHATSAPP_AUDIT_LOG_PATH,
             `${JSON.stringify(record)}\n`,
             'utf8'
         );
@@ -661,12 +748,12 @@ function reportPublicUrl(reportPath) {
     return baseUrl ? `${baseUrl}/${encodeURIComponent(path.basename(reportPath))}` : null;
 }
 
-async function sendReportDocument(chatId, reportPath, caption) {
+async function sendReportDocument(chatId, reportPath, caption, { allowPublicLink = true } = {}) {
     if (!fs.existsSync(reportPath)) {
         throw new Error(`Generated report file is missing: ${reportPath}`);
     }
     const media = MessageMedia.fromFilePath(reportPath);
-    const link = reportPublicUrl(reportPath);
+    const link = allowPublicLink ? reportPublicUrl(reportPath) : null;
     const finalCaption = link ? `${caption}\n\nOpen online: ${link}` : caption;
     await client.sendMessage(chatId, media, { caption: finalCaption });
 }
@@ -815,9 +902,7 @@ function parseMonthlyBudgetPaise() {
 
 function getSmsTransactionStorePath() {
     if (process.env.SMS_TRANSACTION_STORE) return process.env.SMS_TRANSACTION_STORE;
-    const localAppData = process.env.LOCALAPPDATA;
-    if (!localAppData) throw new Error('LOCALAPPDATA is unavailable; set SMS_TRANSACTION_STORE to a private local path.');
-    return path.join(localAppData, 'WhatsAppFoodAgent', 'budget-data', 'android-sms.enc.jsonl');
+    return getPrivateAgentDataPath('budget-data', 'android-sms.enc.jsonl');
 }
 
 function getSmsScanStatePath() {
@@ -825,10 +910,7 @@ function getSmsScanStatePath() {
 }
 
 function getPrivateAgentDataPath(...segments) {
-    const privateRoot = process.env.LOCALAPPDATA
-        ? path.join(process.env.LOCALAPPDATA, 'WhatsAppFoodAgent')
-        : path.join(require('os').homedir(), '.whatsapp-food-agent');
-    return path.join(privateRoot, ...segments);
+    return path.join(getAgentDataDirectory(), ...segments);
 }
 
 function getSmsIngestionSecret() {
@@ -857,7 +939,7 @@ function getSwiggyOrderCacheSecret() {
 
 async function notifySwiggyReauthorizationOnce() {
     if (swiggyReauthNoticeSent || !clientIsReady) return;
-    const chatId = process.env.PERSONAL_CHAT_ID || myPrivateChatId;
+    const chatId = getConfiguredBudgetChatId(process.env.PERSONAL_CHAT_ID);
     if (!chatId) return;
     swiggyReauthNoticeSent = true;
     try {
@@ -947,9 +1029,12 @@ function startSwiggyOrderSyncSchedule() {
 }
 
 async function runMonthlyBudgetReport({ chatId, period = 'current_month', trigger = 'scheduled' }) {
-    if (!chatId) throw new Error('Private self-chat ID is unavailable for the monthly budget report.');
+    const budgetChatId = assertBudgetDeliveryChatId({
+        personalChatId: process.env.PERSONAL_CHAT_ID,
+        requestedChatId: chatId
+    });
     if (process.env.SMS_INGESTION_ENABLED === 'false') {
-        const error = new Error('Android SMS ingestion is disabled. Set SMS_INGESTION_ENABLED=true, keep npm start running, and sync the SMS Budget Companion before retrying.');
+        const error = new Error('Android SMS ingestion is disabled. Set SMS_INGESTION_ENABLED=true, keep the agent online, and sync the SMS Budget Companion before retrying.');
         error.code = 'SMS_SCAN_REQUIRED';
         throw error;
     }
@@ -987,18 +1072,18 @@ async function runMonthlyBudgetReport({ chatId, period = 'current_month', trigge
         result.report.whatsappMessage = formatBudgetWhatsApp(result.report);
     }
 
-    await client.sendMessage(chatId, result.report.whatsappMessage);
+    await client.sendMessage(budgetChatId, result.report.whatsappMessage);
     await sendReportDocument(
-        chatId,
+        budgetChatId,
         result.htmlPath,
-        `💰 *Monthly Budget Report — ${result.report.label}*\n\nOpen the attached HTML document for categorized transactions and receipt items.`
+        `💰 *Monthly Budget Report — ${result.report.label}*\n\nOpen the attached HTML document for categorized transactions and receipt items.`,
+        BUDGET_REPORT_DELIVERY_OPTIONS
     );
     return result;
 }
 
 async function runScheduledBudgetReport({ trigger = 'scheduled', period = 'current_month' } = {}) {
-    const chatId = process.env.PERSONAL_CHAT_ID || myPrivateChatId;
-    if (!chatId) throw new Error('Private self-chat ID is unavailable.');
+    const chatId = assertBudgetDeliveryChatId({ personalChatId: process.env.PERSONAL_CHAT_ID });
     const heading = trigger === 'catch_up' ? 'Scheduled budget catch-up' : 'Scheduled budget report';
     await client.sendMessage(
         chatId,
@@ -1038,6 +1123,10 @@ async function attemptScheduledBudgetReport(trigger) {
 
 function startBudgetSchedule() {
     if (budgetSchedule) return;
+    assertBudgetChatConfiguration({
+        personalChatId: process.env.PERSONAL_CHAT_ID,
+        cookChatId: process.env.COOK_CHAT_ID
+    });
     const allowInitialCatchUp = process.env.BUDGET_ALLOW_INITIAL_CATCH_UP === 'true';
     const initialization = initializeBudgetScheduleState(
         getBudgetScheduleStatePath(),
@@ -1626,7 +1715,13 @@ async function generateSuggestions(mealType, dailyLogs, overallGoal) {
 
 function jidsMatch(jid1, jid2) {
     if (!jid1 || !jid2) return false;
-    return jid1.split('@')[0] === jid2.split('@')[0];
+    const [firstUser, firstDomain = ''] = String(jid1).trim().toLowerCase().split('@');
+    const [secondUser, secondDomain = ''] = String(jid2).trim().toLowerCase().split('@');
+    if (!firstUser || firstUser !== secondUser) return false;
+    if (firstDomain === secondDomain) return true;
+    // A direct WhatsApp identity can appear as phone-number or LID form. Never
+    // equate either form with a group/broadcast/status domain.
+    return ['c.us', 'lid'].includes(firstDomain) && ['c.us', 'lid'].includes(secondDomain);
 }
 
 async function generateDailySummary(dailyLogs, overallGoal) {

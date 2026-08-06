@@ -5,9 +5,10 @@
 **Log meals, maintain a shopping list, get nutrition guidance, generate stock reports, and understand monthly spending — by messaging yourself on WhatsApp.**
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&logoColor=white)
-![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white)
+![Node.js](https://img.shields.io/badge/Cloud%20Node.js-24%20LTS-339933?logo=nodedotjs&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Local first](https://img.shields.io/badge/Runtime-local--first-6A5ACD)
+![Docker](https://img.shields.io/badge/Cloud-Docker-2496ED?logo=docker&logoColor=white)
+![Runtime](https://img.shields.io/badge/Runtime-local%20or%20cloud-6A5ACD)
 
 </div>
 
@@ -15,7 +16,7 @@
 
 ## What is this?
 
-This is a personal assistant that runs on your Windows computer and watches **new messages** in two chosen WhatsApp conversations:
+This is a personal assistant that runs on a Windows computer or a persistent Linux cloud VM and watches **new messages** in two chosen WhatsApp conversations:
 
 - Your personal self-chat: the chat where you message yourself.
 - An optional cook or household chat.
@@ -30,7 +31,7 @@ You talk to it in normal English or Hindi. There are no slash commands to memori
 - build a categorized monthly spending report using transaction SMS, optional Gmail receipts, and optional Swiggy order details.
 
 > [!IMPORTANT]
-> **The computer must be on and `npm start` must remain running.** Closing that terminal stops WhatsApp monitoring, the SMS receiver, and every scheduled job. The agent reads only messages created after it becomes ready; it does not process old WhatsApp history.
+> **One copy of the agent must remain online.** In the local setup, the computer must stay on and `npm start` must keep running. In the cloud setup, Docker restarts the agent automatically on the VM. The agent reads only messages created after it becomes ready; it does not process old WhatsApp history.
 
 > [!CAUTION]
 > This is a private, local automation project, not an official WhatsApp product. It uses `whatsapp-web.js`, so WhatsApp Web changes can occasionally break it. Nutrition values are estimates, and stock reports are research aids—not medical or investment advice.
@@ -43,6 +44,7 @@ You talk to it in normal English or Hindi. There are no slash commands to memori
 - [Complete Windows setup](#complete-windows-setup)
 - [Android SMS and monthly-budget setup](#android-sms-and-monthly-budget-setup)
 - [Swiggy order-history setup](#swiggy-order-history-setup)
+- [Free cloud deployment](#free-cloud-deployment)
 - [Starting and stopping the agent](#starting-and-stopping-the-agent)
 - [Schedules](#schedules)
 - [Local PowerShell commands](#local-powershell-commands)
@@ -131,6 +133,12 @@ is mahine ka kharcha batao
 
 Macro summaries, meal suggestions, stock reports, and budgets are intentionally ignored in the cook chat. Food logging and shopping tasks work in both configured chats. When a food or shopping command comes from the cook chat, its confirmation is sent privately to `PERSONAL_CHAT_ID`.
 
+#### Budget privacy guardrail
+
+Budget access fails closed unless `PERSONAL_CHAT_ID` is explicitly set to a direct `@lid` or `@c.us` chat. Budget requests from the cook chat, groups, or any unrelated chat are ignored; recognizable text requests are rejected before Gemini is called, and voice-derived budget intent is rejected after classification. On-demand status, summaries, HTML attachments, scheduled reports, failures, and Swiggy reauthorization notices are always delivered to the configured personal chat. Budget attachments never use `REPORT_PUBLIC_BASE_URL`, even when stock reports do.
+
+If `PERSONAL_CHAT_ID` is missing, invalid, or identifies the same direct chat as `COOK_CHAT_ID`, the monthly budget schedule stays disabled and the startup log explains why. The encrypted SMS/order files and Google Sheet tabs remain trusted storage surfaces, so protect the VM and Google account permissions as described in [Privacy, storage, and safe GitHub use](#privacy-storage-and-safe-github-use).
+
 ### What is currently not supported?
 
 - Stock commands sent as voice notes. Use a text stock request.
@@ -189,7 +197,7 @@ For stocks, Gemini Search adds optional analyst-source enrichment. If that quota
 - A Windows 10 or Windows 11 computer.
 - A WhatsApp account and phone.
 - A Google account.
-- [Node.js 20 or later](https://nodejs.org/en/download).
+- [Node.js 24 LTS or later](https://nodejs.org/en/download). [Node 20 reached end of life](https://nodejs.org/en/about/eol) and no longer receives security fixes.
 - [Python 3.10 or later](https://www.python.org/downloads/windows/). Python 3.12 is tested.
 - [Brave Browser](https://brave.com/download/) installed at:
 
@@ -242,7 +250,7 @@ py -3 --version
 Test-Path "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 ```
 
-You should see Node 20+, npm, Python 3, and `True` for Brave. If `py` is not recognized, reinstall Python and select **Add Python to PATH**, or later set `PYTHON_EXECUTABLE` in `.env`.
+You should see Node 24+, npm, Python 3, and `True` for Brave. If `py` is not recognized, reinstall Python and select **Add Python to PATH**, or later set `PYTHON_EXECUTABLE` in `.env`.
 
 ### 3. Install dependencies and run tests
 
@@ -443,7 +451,7 @@ COOK_CHAT_ID=exact_cook_chat_id
 Press `Ctrl+C` once to stop the first run. Restart later after finishing the optional budget and Swiggy sections.
 
 > [!TIP]
-> Personal self-chat can often be detected automatically, but explicitly setting the logged `PERSONAL_CHAT_ID` makes scheduled delivery more reliable.
+> The agent can sometimes detect the self-chat for non-budget features, but budget access and its schedule deliberately require the exact logged `PERSONAL_CHAT_ID`. Set it explicitly before startup.
 
 ### 10. Configure and test stock reports
 
@@ -682,11 +690,10 @@ Budget for the month
 
 You do not reinstall or reconfigure anything next month:
 
-1. Keep Windows, the phone, and Tailscale connected.
-2. Run `npm start` and leave it running.
-3. Open the companion and tap **Sync current month now** if the last scan is more than 12 hours old.
-4. Wait for **Last completed full scan** to update.
-5. Send `Budget for the month` to your personal self-chat.
+1. Keep the phone connected to Tailscale. For a local installation, keep Windows connected and `npm start` running. For cloud, confirm `docker compose ps` shows the agent running; no local `npm start` is needed.
+2. Open the companion and tap **Sync current month now** if the last scan is more than 12 hours old.
+3. Wait for **Last completed full scan** to update.
+4. Send `Budget for the month` to your personal self-chat.
 
 The Android app also attempts a full current-month scan after new SMS and about every six hours, but phone battery management can delay background work. A manual sync shortly before the scheduled report on the 26th is the safest option.
 
@@ -697,7 +704,7 @@ The Android app also attempts a full current-month scan after new SMS and about 
 
 ## Swiggy order-history setup
 
-Swiggy enrichment is optional. Budget totals still work from SMS when it is disabled. The integration uses Swiggy's official read-only MCP endpoints; it does not scrape the consumer website and locally refuses cart, checkout, payment, or order-placement tools.
+Swiggy enrichment is optional. Budget totals still work from SMS when it is disabled. The integration uses Swiggy's official read-only MCP endpoints; it does not scrape the consumer website and locally refuses cart, checkout, payment, or order-placement tools. The commands immediately below are for the local Windows setup; cloud authorization is covered in the cloud guide.
 
 Stop `npm start` with `Ctrl+C`, set this in `.env`, and authorize:
 
@@ -730,9 +737,21 @@ Important limitations:
 
 ---
 
+## Free cloud deployment
+
+The repository now includes a Linux/ARM64-compatible Docker image, persistent runtime paths, automatic container restart, a cloud preflight check, and a secure Tailscale layout. The recommended zero-hosting-cost target is an Oracle Cloud Ampere A1 Always Free Ubuntu VM. Gemini and other APIs retain their own quotas or possible charges.
+
+Vercel is not suitable for this application because WhatsApp Web needs one continuously running Chromium process and persistent session storage; stock jobs can also outlive a serverless request. AWS can run the container, but its current free offer is temporary rather than an ongoing free VM.
+
+Follow the **[complete Oracle Cloud deployment guide](CLOUD_DEPLOYMENT.md)**. It includes every Windows and Ubuntu command, credential migration, remote Google/Swiggy authorization, WhatsApp QR pairing, Android companion changes, Tailscale Serve, updates, encrypted backup/restore, and zero-hosting-cost safeguards.
+
+After cloud cutover, stop the Windows copy. Running local and cloud listeners together can process the same message twice.
+
+---
+
 ## Starting and stopping the agent
 
-### Start everything
+### Local Windows: start everything
 
 From the repository root:
 
@@ -752,7 +771,7 @@ That one command starts:
 
 Wait for `Agent is online!`. The WhatsApp session normally runs without opening a visible browser. A browser or QR is needed only for first-time/recovery authorization.
 
-### Stop everything
+### Local Windows: stop everything
 
 Click the terminal running the agent and press:
 
@@ -761,6 +780,18 @@ Ctrl+C
 ```
 
 Do not start a second copy while the first is running. Two copies compete for the same WhatsApp browser profile and cause a `browser is already running ... .wwebjs_auth\session` error.
+
+### Cloud VM: start, stop, and view logs
+
+From `~/whatsApp-agent` on the VM:
+
+```bash
+docker compose up -d
+docker compose logs -f --tail=200 agent
+docker compose stop agent
+```
+
+The Compose restart policy starts the container again after an ordinary VM reboot unless you intentionally stopped it. Never leave the Windows and cloud copies running together.
 
 ### Check current status
 
@@ -777,13 +808,13 @@ The audit log contains every newly received or sent message before chat filterin
 
 | Job | India time | Destination | Requirement |
 |---|---|---|---|
-| Complete stock batch | Monday–Friday at 6:00 PM | Personal WhatsApp chat | `npm start` running, WhatsApp ready, and Python available. |
+| Complete stock batch | Monday–Friday at 6:00 PM | Personal WhatsApp chat | Agent process/container online, WhatsApp ready, and Python available. |
 | Monthly budget | 26th of every month at 6:00 PM | Personal WhatsApp chat | Agent online and a recent complete SMS scan. |
 | Missed budget catch-up check | At minute 5 of every hour | Personal WhatsApp chat | Agent online; persisted once-per-month state and retry rules apply. |
 | Swiggy order sync | Startup and daily at 3:10 AM | Encrypted local cache | Agent online and current Swiggy authorization. |
 | Swiggy pre-budget sync | Immediately before each budget | Encrypted local cache | Same as above; failure falls back safely to existing sources/cache. |
 
-These are in-memory schedules inside `npm start`. There is no separate Windows Scheduled Task or second daemon. If the computer is asleep or the process is closed, the job cannot execute at that moment.
+These are in-memory schedules inside the one Node agent process; there is no separate OS cron, Windows Scheduled Task, or second daemon. If the local process or cloud container is offline, the job cannot execute at that moment.
 
 The budget scheduler checks hourly for a missed eligible run. A failed scheduled attempt becomes eligible again after a six-hour cooldown. A new installation does not unexpectedly backfill the already-missed report for its installation month.
 
@@ -953,7 +984,7 @@ If there is still no timestamp, verify `/health`, re-save the exact endpoint and
 
 ### Budget says SMS coverage is missing or stale
 
-Keep `npm start` running, tap **Sync current month now**, wait for a new completed-scan timestamp, and resend:
+Keep the agent online (`npm start` locally or the Docker container in cloud), tap **Sync current month now**, wait for a new completed-scan timestamp, and resend:
 
 ```text
 Budget for the month
@@ -977,20 +1008,20 @@ If that fails, install Python. If Python exists somewhere unusual, set its full 
 
 ### Where data is stored
 
-| Data | Location | Retention |
+| Data | Windows local / cloud VM location | Retention |
 |---|---|---|
 | Food and budget rows | Your configured Google Sheet | Until you delete them. |
 | Google Tasks | Your default Google Tasks list | Until you complete/delete them. |
-| WhatsApp session | `.wwebjs_auth\` | Until unlinked or deleted. |
-| Google Tasks token | `google-tasks-token.json` | Until revoked/deleted. |
-| Gmail OAuth token | `%LOCALAPPDATA%\WhatsAppFoodAgent\google-budget-token.json` | Until revoked/deleted. |
-| Filtered transaction SMS cache | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\android-sms.enc.jsonl` | Encrypted, append-only; no automatic pruning currently. |
-| SMS scan checkpoints | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\android-sms-scan-state.json` | Latest 24 device/month checkpoints. |
-| Budget HTML/JSON | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-reports\` | One pair per month; no automatic deletion. |
-| Swiggy normalized order cache | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\` | Encrypted; automatically pruned to 90 days. |
-| Swiggy OAuth state | `%LOCALAPPDATA%\WhatsAppFoodAgent\secrets\swiggy-mcp-auth\` | Until expired/replaced/deleted. |
-| Stock reports | `reports\` | Until manually deleted. |
-| WhatsApp audit log | `chat-events.log` | Append-only; no automatic rotation currently. |
+| WhatsApp session | `.wwebjs_auth\` / `cloud-data/whatsapp-auth/` | Until unlinked or deleted. |
+| Google Tasks token | `google-tasks-token.json` / `cloud-data/secrets/google-tasks-token.json` | Until revoked/deleted. |
+| Gmail OAuth token | `%LOCALAPPDATA%\WhatsAppFoodAgent\google-budget-token.json` / `cloud-data/secrets/google-budget-token.json` | Until revoked/deleted. |
+| Filtered transaction SMS cache | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\android-sms.enc.jsonl` / `cloud-data/budget-data/android-sms.enc.jsonl` | Encrypted, append-only; no automatic pruning currently. |
+| SMS scan checkpoints | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\android-sms-scan-state.json` / `cloud-data/budget-data/android-sms-scan-state.json` | Latest 24 device/month checkpoints. |
+| Budget HTML/JSON | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-reports\` / `cloud-data/budget-reports/` | One pair per month; no automatic deletion. |
+| Swiggy normalized order cache | `%LOCALAPPDATA%\WhatsAppFoodAgent\budget-data\` / `cloud-data/budget-data/` | Encrypted; automatically pruned to 90 days. |
+| Swiggy OAuth state | `%LOCALAPPDATA%\WhatsAppFoodAgent\secrets\swiggy-mcp-auth\` / `cloud-data/secrets/swiggy-mcp-auth/` | Until expired/replaced/deleted. |
+| Stock reports | `reports\` / `cloud-data/stock-reports/` | Until manually deleted. |
+| WhatsApp audit log | `chat-events.log` / `cloud-data/logs/chat-events.log` | Append-only; no automatic rotation currently. |
 
 The audit log records up to 500 characters of every new message plus chat/message identifiers, including messages outside the two configured feature chats. Protect it accordingly.
 

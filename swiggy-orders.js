@@ -1,10 +1,10 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
-const os = require('node:os');
 const path = require('node:path');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+const { getAgentDataDirectory } = require('./runtime-paths');
 
 const SWIGGY_ENDPOINTS = Object.freeze({
     swiggy_instamart: 'https://mcp.swiggy.com/im',
@@ -34,9 +34,16 @@ const CACHE_RETENTION_DAYS = 90;
 // an interactive OAuth browser flow on an ordinary expiry.
 const RUNTIME_AUTH_MAX_AGE_MS = 114 * 60 * 60 * 1000;
 
+function getConfiguredCallbackPort(provider, env = process.env) {
+    const envName = provider === 'swiggy_instamart'
+        ? 'SWIGGY_INSTAMART_CALLBACK_PORT'
+        : 'SWIGGY_FOOD_CALLBACK_PORT';
+    const value = Number(env[envName]);
+    return Number.isInteger(value) && value >= 1024 && value <= 65535 ? value : null;
+}
+
 function getDefaultSwiggyAuthDirectory() {
-    const localData = process.env.LOCALAPPDATA || os.homedir();
-    return path.join(localData, 'WhatsAppFoodAgent', 'secrets', 'swiggy-mcp-auth');
+    return path.join(getAgentDataDirectory(), 'secrets', 'swiggy-mcp-auth');
 }
 
 function resolveProvider(providerOrEndpoint) {
@@ -124,7 +131,14 @@ async function createSwiggyMcpClient(provider, options = {}) {
     }
 
     const proxyPath = require.resolve('mcp-remote/dist/proxy.js');
-    const args = [proxyPath, SWIGGY_ENDPOINTS[provider], '--transport', 'http-first'];
+    const callbackPort = getConfiguredCallbackPort(provider);
+    const args = [
+        proxyPath,
+        SWIGGY_ENDPOINTS[provider],
+        ...(callbackPort ? [String(callbackPort)] : []),
+        '--transport',
+        'http-first'
+    ];
     if (allowInteractiveAuth) args.push('--auth-timeout', '240');
 
     let intentionallyClosing = false;
@@ -853,6 +867,7 @@ module.exports = {
     CACHE_RETENTION_DAYS,
     RUNTIME_AUTH_MAX_AGE_MS,
     getDefaultSwiggyAuthDirectory,
+    getConfiguredCallbackPort,
     hasSwiggyAuthState,
     assertAllowedSwiggyTool,
     createSwiggyMcpClient,

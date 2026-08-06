@@ -1,4 +1,4 @@
-google-genai>=1.0.0
-pandas>=2.2.0
-requests>=2.31.0
-yfinance>=0.2.65
+google-genai==2.14.0
+pandas==3.0.5
+requests==2.34.2
+yfinance==1.5.2

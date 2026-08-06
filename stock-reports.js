@@ -2,10 +2,15 @@ const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { resolveRuntimePath } = require('./runtime-paths');
 
 const PROJECT_DIR = __dirname;
 const SCRIPT_PATH = path.join(PROJECT_DIR, 'gemini-code.py');
-const REPORTS_DIR = path.join(PROJECT_DIR, 'reports');
+const REPORTS_DIR = resolveRuntimePath({
+    envKey: 'STOCK_REPORTS_DIR',
+    relativeSegments: ['stock-reports'],
+    legacyPath: path.join(PROJECT_DIR, 'reports')
+});
 const RESULT_MARKER = 'REPORT_RESULT_JSON=';
 
 const STOCK_WORDS = /\b(?:stocks?|tickers?|shares?|equities|equity|valuations?|reports?|analysis|analyse|analyze)\b/i;

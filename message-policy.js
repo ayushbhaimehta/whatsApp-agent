@@ -101,7 +101,7 @@ function resolveTextShortcut({ text, isPrivateChat, parseStockRequest, extractTi
     return null;
 }
 
-function resolveGeminiAction({ result, isCookChat, isPrivateChat }) {
+function resolveGeminiAction({ result, isCookChat, isPrivateChat, canAccessBudget = false }) {
     if (!isCookChat && !isPrivateChat) return { action: 'ignore' };
     const intent = result?.intent || 'none';
     if (intent === 'log_food' && Array.isArray(result.items) && result.items.length > 0) {
@@ -119,7 +119,7 @@ function resolveGeminiAction({ result, isCookChat, isPrivateChat }) {
         return { action: isPrivateChat ? 'summarize_day' : 'ignore' };
     }
     if (intent === 'monthly_budget') {
-        return isPrivateChat
+        return canAccessBudget
             ? { action: 'monthly_budget', period: result.period || 'current_month' }
             : { action: 'ignore' };
     }

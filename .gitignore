@@ -3,6 +3,7 @@ node_modules/
 
 # Local environment configuration
 .env
+.env.cloud
 
 # Google API Credentials (extremely sensitive!)
 service-account.json
@@ -25,8 +26,11 @@ Desktop.ini
 
 # Generated stock reports
 reports/
+cloud-data/
 budget-reports/
 budget-data/
+budget_*.html
+budget_*.json
 __pycache__/
 *.py[cod]
 .agent-status.json

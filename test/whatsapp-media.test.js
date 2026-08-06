@@ -12,18 +12,18 @@ const quietLogger = { info() {}, warn() {} };
 test('reconstructs the serialized ID missing from current outgoing WhatsApp messages', () => {
     const message = {
         fromMe: true,
-        from: '917879038278@c.us',
-        to: '8714656465067@lid',
+        from: '919000000001@c.us',
+        to: '123456789012345@lid',
         id: {
             fromMe: true,
-            remote: '8714656465067@lid',
+            remote: '123456789012345@lid',
             id: 'AC5601C0D8C84A03784EA00985082C9A'
         }
     };
 
     assert.equal(
         buildSerializedMessageId(message),
-        'true_8714656465067@lid_AC5601C0D8C84A03784EA00985082C9A'
+        'true_123456789012345@lid_AC5601C0D8C84A03784EA00985082C9A'
     );
 });
 
