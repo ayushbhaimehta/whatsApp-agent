@@ -14,6 +14,7 @@ services:
       TZ: Asia/Kolkata
       AGENT_DATA_DIR: /data
       WHATSAPP_AUTH_PATH: /data/whatsapp-auth
+      WHATSAPP_WEB_CACHE_PATH: /data/whatsapp-web-cache
       WHATSAPP_BROWSER_EXECUTABLE: /usr/bin/chromium
       GOOGLE_APPLICATION_CREDENTIALS: /data/secrets/service-account.json
       GOOGLE_TASKS_TOKEN_PATH: /data/secrets/google-tasks-token.json

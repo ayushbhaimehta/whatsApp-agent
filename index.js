@@ -33,6 +33,11 @@ const WHATSAPP_AUTH_PATH = resolveRuntimePath({
     relativeSegments: ['whatsapp-auth'],
     legacyPath: null
 });
+const WHATSAPP_WEB_CACHE_PATH = resolveRuntimePath({
+    envKey: 'WHATSAPP_WEB_CACHE_PATH',
+    relativeSegments: ['whatsapp-web-cache'],
+    legacyPath: path.join(__dirname, '.wwebjs_cache')
+});
 
 function ensureParentDirectory(filePath) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -193,6 +198,15 @@ const whatsappPuppeteerOptions = {
 const client = new Client({
     authStrategy: new LocalAuth(WHATSAPP_AUTH_PATH ? { dataPath: WHATSAPP_AUTH_PATH } : {}),
     authTimeoutMs: 300000,
+    // whatsapp-web.js persists the authenticated page before injecting its
+    // message/event utilities. In a non-root container /app is intentionally
+    // read-only, so the default ./.wwebjs_cache path aborts readiness with a
+    // silent EACCES. Keep the cache in the writable persistent data volume.
+    webVersionCache: {
+        type: 'local',
+        path: WHATSAPP_WEB_CACHE_PATH,
+        strict: false
+    },
     puppeteer: whatsappPuppeteerOptions
 });
 const configuredWhatsAppReadyTimeout = Number(process.env.WHATSAPP_READY_TIMEOUT_MS);
