@@ -157,6 +157,95 @@ TICKER_THEME_OVERRIDES = {
 }
 
 
+MEMORY_STORAGE_SUBTYPE_OVERRIDES = {
+    "SNDK": "NAND_FLASH",
+    "285A.T": "NAND_FLASH",
+    "MU": "DIVERSIFIED_MEMORY",
+    "000660.KS": "DIVERSIFIED_MEMORY",
+    "005930.KS": "DIVERSIFIED_MEMORY",
+    "WDC": "HDD",
+    "STX": "HDD",
+    "SIMO": "CONTROLLER",
+    "RMBS": "MEMORY_IP",
+}
+
+
+def infer_memory_storage_subtype(ticker, company_text=""):
+    """Separate NAND producers from economically different storage businesses."""
+    symbol = str(ticker or "").strip().upper()
+    if symbol in MEMORY_STORAGE_SUBTYPE_OVERRIDES:
+        return MEMORY_STORAGE_SUBTYPE_OVERRIDES[symbol]
+    text = str(company_text or "").lower()
+    if "nand" in text or "flash memory" in text or "solid state drive" in text:
+        return "NAND_FLASH"
+    if "dram" in text or "high bandwidth memory" in text or "hbm" in text:
+        return "DIVERSIFIED_MEMORY"
+    if "hard disk" in text or "hdd" in text:
+        return "HDD"
+    if "controller" in text:
+        return "CONTROLLER"
+    if "memory interface" in text or "semiconductor ip" in text:
+        return "MEMORY_IP"
+    return "GENERAL_MEMORY_STORAGE"
+
+
+def memory_storage_valuation_policy(ticker, company_text=""):
+    """Return a transparent policy overlay for memory/storage valuation.
+
+    Sandisk is a NAND/flash producer with joint-venture wafer economics. Treating
+    it like an HDD vendor, controller designer, or IP licensor depresses both its
+    normalized margin and peer multiple. The overlay still excludes analyst price
+    targets; it changes only operating assumptions and comparable companies.
+    """
+    subtype = infer_memory_storage_subtype(ticker, company_text)
+    policies = {
+        "NAND_FLASH": {
+            "subtype": subtype,
+            "label": "NAND Flash & Enterprise SSD",
+            "peer_symbols": ["285A.T", "MU", "000660.KS", "005930.KS"],
+            "weights": {
+                "DCF": 0.05,
+                "Forward P/E": 0.45,
+                "Normalized P/E": 0.25,
+                "EV/EBITDA": 0.25,
+            },
+            "growth_cap": 0.55,
+            "terminal_margin_floor": 0.12,
+            "terminal_margin_cap": 0.50,
+            "forward_ebit_margin_cap": 0.90,
+            "structural_forward_eps_weight": 0.75,
+            "structural_forward_pe_floor": 7.0,
+            "structural_normalized_pe_floor": 6.5,
+            "outlier_band": (0.45, 2.10),
+        },
+        "DIVERSIFIED_MEMORY": {
+            "subtype": subtype,
+            "label": "Diversified DRAM & NAND Memory",
+            "peer_symbols": ["SNDK", "285A.T", "000660.KS", "005930.KS"],
+        },
+        "HDD": {
+            "subtype": subtype,
+            "label": "Hard-Disk Storage",
+            "peer_symbols": ["WDC", "STX"],
+        },
+        "CONTROLLER": {
+            "subtype": subtype,
+            "label": "Storage Controller Semiconductors",
+            "peer_symbols": ["SIMO", "MRVL", "MCHP"],
+        },
+        "MEMORY_IP": {
+            "subtype": subtype,
+            "label": "Memory Interface IP",
+            "peer_symbols": ["RMBS", "ARM", "SNPS", "CDNS"],
+        },
+    }
+    return dict(policies.get(subtype, {
+        "subtype": subtype,
+        "label": "General Memory & Storage",
+        "peer_symbols": ["MU", "SNDK", "WDC", "STX"],
+    }))
+
+
 POSITIVE_PHRASES = {
     "raises guidance": 1.00, "raised guidance": 1.00, "guidance raised": 1.00,
     "beats estimates": 0.85, "beat estimates": 0.85, "earnings beat": 0.80,
@@ -866,8 +955,20 @@ def aggregate_market_signal(scored_items, technical):
 
 _TARGET_PATTERNS = (
     re.compile(
-        r"price\s+target\s+(?:is\s+)?(?:raised|lifted|increased|boosted|cut|lowered|reduced)?\s*"
+        r"price\s+target(?:\s+(?:on|for)\s+[A-Za-z0-9&.'() -]{1,70})?\s+"
+        r"(?:raised|lifted|increased|boosted|adjusted|cut|lowered|reduced)?\s*"
+        r"to\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+from\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)",
+        re.I,
+    ),
+    re.compile(
+        r"price\s+target(?:\s+(?:on|for)\s+[A-Za-z0-9&.'() -]{1,70})?\s+"
+        r"(?:is\s+)?(?:raised|lifted|increased|boosted|adjusted|cut|lowered|reduced)?\s*"
         r"(?:from\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+)?(?:to|at|of)\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:PT|price\s+target)\s+(?:raised|lowered|adjusted)?\s*to\s+"
+        r"\$?([0-9][0-9,]*(?:\.[0-9]+)?)",
         re.I,
     ),
     re.compile(r"\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+price\s+target", re.I),
@@ -887,10 +988,12 @@ def _extract_firm(text, company_name="", ticker=""):
     # Keep the action alternatives inside one non-capturing group. Without the
     # group, regex alternation can match a bare verb elsewhere in the headline,
     # leaving the required firm capture as None (a common public-feed shape).
-    action = r"(?:raises?|cuts?|lowers?|boosts?|lifts?|initiates?|upgrades?|downgrades?|maintains?|reiterates?)"
+    action = r"(?:raises?|cuts?|lowers?|boosts?|lifts?|increases?|decreases?|adjusts?|initiates?|upgrades?|downgrades?|maintains?|reiterates?|announces?)"
     patterns = (
-        re.compile(rf"^([A-Z][A-Za-z0-9&.' -]{{2,45}}?)\s+{action}\b"),
-        re.compile(r"\b(?:at|by)\s+([A-Z][A-Za-z0-9&.' -]{2,45}?)(?:\s*[-:;,]|$)"),
+        re.compile(rf"^([A-Z][A-Za-z0-9&.' -]{{2,45}}?)\s+{action}\b", re.I),
+        re.compile(rf"^([A-Z][A-Za-z0-9&.' -]{{2,45}}?)\s+analyst\s+[A-Z][A-Za-z.' -]{{2,45}}?\s+{action}\b", re.I),
+        re.compile(r"\b(?:at|by)\s+([A-Z][A-Za-z0-9&.' -]{2,45}?)(?:\s*[-:;,]|$)", re.I),
+        re.compile(r"\b(?:upgraded|downgraded|initiated)\s+at\s+([A-Z][A-Za-z0-9&.' -]{2,45}?)(?:\s+with|\s*[-:;,]|$)", re.I),
     )
     for pattern in patterns:
         match = pattern.search(text)
@@ -914,6 +1017,85 @@ def _extract_firm(text, company_name="", ticker=""):
             ):
                 return candidate
     return ""
+
+
+def _extract_analyst_name(text):
+    patterns = (
+        re.compile(
+            r"\b(?:analyst|strategist)\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s+"
+            r"(?:raises?|cuts?|lowers?|boosts?|lifts?|adjusts?|initiates?|upgrades?|downgrades?|maintains?|reiterates?)\b",
+            re.I,
+        ),
+        re.compile(
+            r"\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}),?\s+(?:an?\s+)?analyst\s+at\b",
+            re.I,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.search(str(text or ""))
+        if match:
+            candidate = " ".join(match.group(1).split()).strip(" -:,.;")
+            if 2 <= len(candidate.split()) <= 4:
+                return candidate.title()
+    return "Not disclosed"
+
+
+def normalize_yahoo_analyst_history(frame, ticker, *, as_of=None, limit=250):
+    """Normalize Yahoo's dated firm-level rating and target history.
+
+    Recent Yahoo responses include currentPriceTarget/priorPriceTarget columns.
+    Older versions exposed ratings only, so every field remains optional. This
+    deterministic provider feed works even when Gemini grounding is unavailable.
+    """
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    symbol = str(ticker or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9.^=-]{1,20}", symbol):
+        return []
+    try:
+        records = frame.reset_index().head(max(1, min(int(limit), 500))).to_dict("records")
+    except Exception:
+        return []
+
+    def first(record, *names, default=None):
+        for name in names:
+            value = record.get(name)
+            if value is not None and str(value).strip() not in {"", "nan", "NaT"}:
+                return value
+        return default
+
+    def number(value):
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for record in records:
+        date_value = first(record, "GradeDate", "date", "Date", "index")
+        if not current_calendar_year(date_value, as_of=as_of):
+            continue
+        firm = " ".join(str(first(record, "Firm", "firm", default="")).split())
+        rating = " ".join(str(first(record, "ToGrade", "toGrade", default="N/A")).split()) or "N/A"
+        target = number(first(record, "currentPriceTarget", "priceTarget", "targetPrice"))
+        previous_target = number(first(record, "priorPriceTarget", "previousPriceTarget"))
+        if not firm or (rating.upper() == "N/A" and target is None):
+            continue
+        parsed_date = _coerce_datetime(date_value)
+        rows.append({
+            "date": parsed_date.strftime("%Y-%m-%d") if parsed_date else str(date_value),
+            "analyst": "Not disclosed",
+            "firm": firm,
+            "previous_rating": str(first(record, "FromGrade", "fromGrade", default="N/A")),
+            "new_rating": rating,
+            "price_target": target,
+            "previous_price_target": previous_target,
+            "source_url": f"https://finance.yahoo.com/quote/{symbol}/analysis/",
+            "source_title": "Yahoo Finance dated analyst history",
+            "record_origin": "Yahoo Finance provider feed",
+        })
+    return rows
 
 
 def extract_current_year_analyst_targets(items, ticker, company_name, current_price, *, as_of=None):
@@ -947,8 +1129,14 @@ def extract_current_year_analyst_targets(items, ticker, company_name, current_pr
             if not match:
                 continue
             if len(match.groups()) == 2:
-                previous = float(match.group(1).replace(",", "")) if match.group(1) else None
-                target = float(match.group(2).replace(",", ""))
+                # Most patterns capture old/new; the explicit "to X from Y"
+                # pattern captures new/old.
+                if re.search(r"\bto\s+\$?[0-9][0-9,.]*\s+from\b", match.group(0), re.I):
+                    target = float(match.group(1).replace(",", ""))
+                    previous = float(match.group(2).replace(",", "")) if match.group(2) else None
+                else:
+                    previous = float(match.group(1).replace(",", "")) if match.group(1) else None
+                    target = float(match.group(2).replace(",", ""))
             else:
                 target = float(match.group(1).replace(",", ""))
             break
@@ -970,7 +1158,7 @@ def extract_current_year_analyst_targets(items, ticker, company_name, current_pr
             rating = rating_match.group(1).title()
         rows.append({
             "date": published.strftime("%Y-%m-%d"),
-            "analyst": "Not disclosed",
+            "analyst": _extract_analyst_name(text),
             "firm": firm,
             "previous_rating": "N/A",
             "new_rating": rating,

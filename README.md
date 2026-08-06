@@ -814,17 +814,113 @@ Ctrl+C
 
 Do not start a second copy while the first is running. Two copies compete for the same WhatsApp browser profile and cause a `browser is already running ... .wwebjs_auth\session` error.
 
-### Cloud VM: start, stop, and view logs
+### AWS EC2: connect, start, stop, and view logs
 
-From `~/whatsApp-agent` on the VM:
+There are two different terminals in this process. Run the first command in
+**Windows PowerShell**. Run all Docker commands only after you are connected to
+the **EC2 Ubuntu terminal**.
 
-```bash
-docker compose up -d
-docker compose logs -f --tail=200 agent
-docker compose stop agent
+#### 1. Connect to EC2 from Windows PowerShell
+
+Replace the example IP address if the EC2 public IP has changed:
+
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\aws-whatsapp-agent" ubuntu@15.135.169.83
 ```
 
-The Compose restart policy starts the container again after an ordinary VM reboot unless you intentionally stopped it. Never leave the Windows and cloud copies running together.
+When the prompt changes to something similar to
+`ubuntu@ip-172-31-42-228:~$`, you are inside EC2.
+
+#### 2. Start the agent on EC2
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud up -d agent
+docker compose --env-file .env.cloud ps
+```
+
+The `-d` option leaves the agent running in the background after the command
+finishes. In the `ps` result, the `agent` service should show as `Up` or
+`running`.
+
+If you have just pulled new code, rebuild the image and recreate the container:
+
+```bash
+cd ~/whatsApp-agent
+git pull --ff-only origin master
+docker compose --env-file .env.cloud up -d --build --force-recreate agent
+```
+
+#### 3. Check the logs
+
+Show the latest 200 log lines and return to the prompt:
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud logs --tail=200 agent
+```
+
+Watch new log lines continuously:
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud logs -f --tail=100 agent
+```
+
+Press `Ctrl+C` to leave the live log viewer. This does **not** stop the agent;
+it continues running in the background.
+
+#### 4. Stop or restart the agent
+
+Stop it intentionally:
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud stop agent
+```
+
+Start the same stopped container again:
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud start agent
+```
+
+Restart a running agent:
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud restart agent
+```
+
+To shut down and remove the Compose container and network, while keeping the
+bind-mounted `cloud-data` folder:
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud down
+```
+
+For normal stopping, prefer `stop agent`. Do not add `-v`, run a volume-pruning
+command, or delete `cloud-data`; that directory contains the persistent
+WhatsApp session, secrets, SMS data, reports, and logs.
+
+#### 5. Confirm that the services are healthy
+
+```bash
+cd ~/whatsApp-agent
+docker compose --env-file .env.cloud ps
+curl http://127.0.0.1:8787/health
+cat cloud-data/status/agent-status.json
+```
+
+The health URL becomes available after the agent has initialized its SMS
+receiver. The status file shows the current WhatsApp lifecycle state.
+
+The Compose restart policy starts the container again after an ordinary VM
+reboot unless you intentionally stopped it. Typing `exit` only closes the SSH
+connection; it does not stop the background agent. Never leave the Windows and
+EC2 copies running together because both copies can process the same message.
 
 ### Check current status
 

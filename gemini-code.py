@@ -36,6 +36,8 @@ from stock_intelligence import (
     build_market_intelligence,
     current_calendar_year,
     extract_current_year_analyst_targets,
+    memory_storage_valuation_policy,
+    normalize_yahoo_analyst_history,
     validate_current_year_analyst_record,
 )
 try:
@@ -897,9 +899,28 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     rev_0y_avg = plausible_estimate(estimate_value(revenue_estimates, "0y", "avg"), revenue_ttm)
     rev_0y_low = plausible_estimate(estimate_value(revenue_estimates, "0y", "low"), revenue_ttm)
     rev_0y_high = plausible_estimate(estimate_value(revenue_estimates, "0y", "high"), revenue_ttm)
-    rev_1y_avg = plausible_estimate(estimate_value(revenue_estimates, "+1y", "avg"), revenue_ttm)
-    rev_1y_low = plausible_estimate(estimate_value(revenue_estimates, "+1y", "low"), revenue_ttm)
-    rev_1y_high = plausible_estimate(estimate_value(revenue_estimates, "+1y", "high"), revenue_ttm)
+    # +1y must be checked against the immediately preceding forecast year, not a
+    # stale/incomplete TTM base. This matters after separations and sharp cycle
+    # inflections (SNDK): its +1y estimate is modest versus 0y, even though both
+    # can be more than 4x an incomplete trailing statement window.
+    rev_1y_avg = plausible_estimate(
+        estimate_value(revenue_estimates, "+1y", "avg"),
+        rev_0y_avg or revenue_ttm,
+        low_factor=0.40,
+        high_factor=2.50,
+    )
+    rev_1y_low = plausible_estimate(
+        estimate_value(revenue_estimates, "+1y", "low"),
+        rev_0y_low or rev_0y_avg or revenue_ttm,
+        low_factor=0.35,
+        high_factor=3.00,
+    )
+    rev_1y_high = plausible_estimate(
+        estimate_value(revenue_estimates, "+1y", "high"),
+        rev_0y_high or rev_0y_avg or revenue_ttm,
+        low_factor=0.35,
+        high_factor=3.00,
+    )
 
     eps_0y_avg = normalize_per_share_quote(estimate_value(earnings_estimates, "0y", "avg"))
     eps_0y_low = normalize_per_share_quote(estimate_value(earnings_estimates, "0y", "low"))
@@ -961,7 +982,23 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     valuation_archetype_id = classify_ai_archetype()
     valuation_archetype = ARCHETYPE_LABELS[valuation_archetype_id]
-    config = ARCHETYPE_CONFIG[valuation_archetype_id]
+    config = dict(ARCHETYPE_CONFIG[valuation_archetype_id])
+    memory_policy = None
+    if valuation_archetype_id == "MEMORY_STORAGE":
+        memory_policy = memory_storage_valuation_policy(
+            TICKER_SYMBOL,
+            " ".join([
+                str(company_name), str(sector), str(industry),
+                str(info.get("longBusinessSummary") or ""),
+            ]),
+        )
+        for field in (
+            "weights", "growth_cap", "terminal_margin_floor",
+            "terminal_margin_cap", "outlier_band",
+        ):
+            if field in memory_policy:
+                config[field] = memory_policy[field]
+        valuation_archetype = f"{valuation_archetype} — {memory_policy['label']}"
 
     # A stage overlay matters as much as sector. Bloom Energy and Eaton both benefit
     # from data-center power demand, but one may require an EV/Sales / margin-ramp
@@ -1046,7 +1083,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         return finite_median(values, default)
 
 
-    peer_symbols = [s for s in PEER_GROUPS[valuation_archetype_id] if s != TICKER_SYMBOL.upper()][:6]
+    peer_universe = (
+        memory_policy.get("peer_symbols", [])
+        if memory_policy else PEER_GROUPS[valuation_archetype_id]
+    )
+    peer_symbols = [s for s in peer_universe if s != TICKER_SYMBOL.upper()][:6]
     peer_data = [peer_snapshot(symbol) for symbol in peer_symbols]
     peer_data = [item for item in peer_data if item]
     peer_count = len(peer_data)
@@ -1126,8 +1167,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         return eps_value if -0.25 <= implied_margin <= 0.75 else None
 
 
-    forward_eps_year1 = validated_eps(eps_0y_avg, forward_revenue_year1)
-    forward_eps_year2 = validated_eps(eps_1y_avg, forward_revenue_year2)
+    # EPS and revenue must be checked against the same forecast period. Comparing
+    # consensus EPS with a shrinkage-blended revenue denominator falsely rejected
+    # Sandisk's high-margin NAND estimates and removed the forward valuation leg.
+    forward_eps_year1 = validated_eps(eps_0y_avg, rev_0y_avg or forward_revenue_year1)
+    forward_eps_year2 = validated_eps(eps_1y_avg, rev_1y_avg or forward_revenue_year2)
     if forward_eps_year2 is None:
         forward_eps_year2 = validated_eps(info.get("forwardEps"), forward_revenue_year2)
 
@@ -1156,7 +1200,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         pretax_income = net_income / max(1 - effective_tax_rate, 0.55)
         ebit = pretax_income + interest_ttm
         margin = safe_ratio(ebit, revenue_value, None)
-        return margin if margin is not None and -0.35 <= margin <= 0.70 else None
+        upper_margin = memory_policy.get("forward_ebit_margin_cap", 0.70) if memory_policy else 0.70
+        return margin if margin is not None and -0.35 <= margin <= upper_margin else None
 
 
     forward_margin_year1 = eps_implied_ebit_margin(forward_eps_year1, forward_revenue_year1)
@@ -1167,7 +1212,22 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     # mature margin; early-stage infrastructure uses a credible margin-ramp endpoint.
     historical_margin_anchor = normalized_ebit_margin
     peer_margin_anchor = peer_operating_margin if peer_operating_margin is not None else historical_margin_anchor
-    if valuation_archetype_id == "MEMORY_STORAGE":
+    if valuation_archetype_id == "MEMORY_STORAGE" and memory_policy and memory_policy.get("subtype") == "NAND_FLASH":
+        # NAND contracts and enterprise-SSD mix can create a structural earnings
+        # transition that old carve-out history does not represent. Keep a sizable
+        # mid-cycle/historical anchor, while admitting period-matched forward
+        # operating evidence after its independent sanity check.
+        forward_margin_anchor = finite_median(
+            [forward_margin_year1, forward_margin_year2],
+            current_operating_margin or historical_margin_anchor,
+        )
+        target_operating_margin = (
+            0.25 * historical_margin_anchor
+            + 0.20 * peer_margin_anchor
+            + 0.20 * (current_operating_margin or historical_margin_anchor)
+            + 0.35 * forward_margin_anchor
+        )
+    elif valuation_archetype_id == "MEMORY_STORAGE":
         target_operating_margin = 0.65 * historical_margin_anchor + 0.35 * peer_margin_anchor
     elif high_growth_stage or valuation_archetype_id in {"AI_CLOUD_INFRA", "AI_SOFTWARE"}:
         target_operating_margin = 0.25 * max(current_operating_margin or 0.0, 0.0) + 0.75 * peer_margin_anchor
@@ -1379,6 +1439,16 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     relative_factor = relative_adjustment()
 
+    nand_structural_transition = bool(
+        memory_policy
+        and memory_policy.get("subtype") == "NAND_FLASH"
+        and forward_eps_year2 is not None
+        and rev_0y_avg is not None
+        and rev_1y_avg is not None
+        and safe_ratio(rev_1y_avg, rev_0y_avg, 1.0) - 1.0 > 0.10
+        and operating_estimate_count >= 5
+    )
+
 
     def scenario_forward_eps(name):
         params = scenario_parameters(name)
@@ -1416,7 +1486,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             return None
         multiple = sum(v * w for v, w in candidates) / sum(w for _, w in candidates)
         multiple *= 1 + scenario_parameters(name)["multiple_shift"]
-        return eps * clamp(multiple, 4.0, 90.0)
+        multiple_floor = (
+            memory_policy.get("structural_forward_pe_floor", 4.0)
+            if nand_structural_transition else 4.0
+        )
+        return eps * clamp(multiple, multiple_floor, 90.0)
 
 
     def normalized_pe_value(name):
@@ -1442,7 +1516,10 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             and forward_growth > 0.10
             and (forward_margin_year2 or target_operating_margin) > target_operating_margin + 0.04
         )
-        forward_weight = 0.65 if structural_upcycle else 0.45
+        forward_weight = (
+            memory_policy.get("structural_forward_eps_weight", 0.75)
+            if nand_structural_transition else 0.65 if structural_upcycle else 0.45
+        )
         if forward_growth < 0 or (forward_margin_year2 is not None and forward_margin_year2 < target_operating_margin):
             forward_weight = 0.25
         valuation_eps = (
@@ -1451,7 +1528,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         )
         base_multiple = peer_forward_pe or positive_float(info.get("forwardPE")) or 14.0
         # Mid-cycle multiples should not capitalize peak growth indefinitely.
-        multiple = clamp(base_multiple * relative_factor, 6.0, 28.0)
+        multiple_floor = (
+            memory_policy.get("structural_normalized_pe_floor", 6.0)
+            if nand_structural_transition else 6.0
+        )
+        multiple = clamp(base_multiple * relative_factor, multiple_floor, 28.0)
         multiple *= 1 + params["multiple_shift"]
         return valuation_eps * multiple
 
@@ -1584,14 +1665,24 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     scenario_method_values = {}
+    scenario_raw_method_values = {}
     scenario_values = {}
     for scenario_name in ["Bear", "Base", "Bull"]:
         raw_values = method_values(scenario_name)
+        scenario_raw_method_values[scenario_name] = raw_values
         composite, used_values = robust_weighted_composite(
             raw_values, config["weights"], config["outlier_band"]
         )
         scenario_method_values[scenario_name] = used_values
         scenario_values[scenario_name] = composite
+
+    print(
+        "Base valuation methods (pre-winsorization): "
+        + ", ".join(
+            f"{name}=${value:,.2f}"
+            for name, value in scenario_raw_method_values.get("Base", {}).items()
+        )
+    )
 
     intrinsic_value = scenario_values.get("Base")
     bear_price = scenario_values.get("Bear")
@@ -2081,7 +2172,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     def canonical_firm(value):
         """Normalize common brokerage-name variants for record matching only."""
         name = str(value or "").strip().lower()
-        for token in [",", ".", " inc", " llc", " ltd", " securities", " capital markets", " research"]:
+        for token in [",", ".", " inc", " llc", " ltd", " group", " securities", " capital markets", " research"]:
             name = name.replace(token, "")
         aliases = {
             "b of a": "bank of america",
@@ -2152,36 +2243,13 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         return merged
 
     def fetch_yahoo_fallback_records():
-        """Last-resort firm-level actions. Yahoo generally lacks analyst names and targets."""
+        """Deterministic dated firm actions from Yahoo, including targets when supplied."""
         try:
             frame = stock.get_upgrades_downgrades()
         except Exception as exc:
             print(f"Yahoo upgrades/downgrades fallback failed: {exc}")
             return []
-        if frame is None or frame.empty:
-            return []
-
-        frame = frame.reset_index()
-        rows = []
-        for _, row in frame.head(20).iterrows():
-            row_dict = row.to_dict()
-            date_value = first_present(row_dict, "GradeDate", "date", "Date", "index", default="N/A")
-            firm = first_present(row_dict, "Firm", "firm", default="Not disclosed")
-            new_rating = first_present(row_dict, "ToGrade", "toGrade", default="N/A")
-            previous_rating = first_present(row_dict, "FromGrade", "fromGrade", default="N/A")
-            if firm == "Not disclosed" or new_rating == "N/A":
-                continue
-            rows.append({
-                "date": str(date_value),
-                "analyst": "Not disclosed",
-                "firm": str(firm),
-                "previous_rating": str(previous_rating),
-                "new_rating": str(new_rating),
-                "price_target": None,
-                "source_url": "",
-                "source_title": "Yahoo Finance upgrades/downgrades",
-            })
-        return rows
+        return normalize_yahoo_analyst_history(frame, TICKER_SYMBOL)
 
 
     analyst_records = []
@@ -2254,7 +2322,25 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         deduped.values(),
         key=lambda item: sortable_date(item.get("date")),
         reverse=True,
-    )[:15]
+    )
+
+    # A current consensus must give each research firm one vote. Keeping every
+    # historical target change would overweight firms that update more often and
+    # is the main reason action-history means diverge from Street consensus.
+    latest_by_firm = {}
+    for record in analyst_records:
+        firm_key = canonical_firm(record.get("firm"))
+        if not firm_key:
+            continue
+        existing = latest_by_firm.get(firm_key)
+        if existing is None:
+            latest_by_firm[firm_key] = record
+        elif existing.get("price_target") is None and record.get("price_target") is not None:
+            # Prefer the newest target-bearing action for target statistics. A
+            # newer rating-only action remains discoverable at its provider URL,
+            # but must not erase a still-current published target from this year.
+            latest_by_firm[firm_key] = record
+    analyst_records = list(latest_by_firm.values())[:50]
 
     # Statistics from the actual individually collected target-bearing rows.
     collected_target_values = [
@@ -2285,7 +2371,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     combined_target_high = collected_target_high
     combined_target_low = collected_target_low
     combined_target_source = (
-        f"Calculated only from {collected_target_count} verified {REPORT_YEAR} YTD target action(s)"
+        f"Calculated from the latest verified {REPORT_YEAR} target-bearing action for each of {collected_target_count} firm(s)"
         if collected_target_count
         else f"No verified {REPORT_YEAR} YTD target actions were available"
     )
@@ -2515,7 +2601,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         </table>
         <div class="note"><strong>Architecture:</strong> {escape(valuation_archetype)}. Analyst price-target weight: 0%. FY1/FY2 operating-estimate weight: {operating_estimate_weight:.0%}. Model versus Street: {escape(street_comparison)}.</div>
 
-        <h2>2. Verified Wall Street Actions — {REPORT_YEAR} YTD</h2>
+        <h2>2. Latest Verified Wall Street Action Per Firm — {REPORT_YEAR} YTD</h2>
         <div class="summary-grid">
             <div class="card"><div class="label">YTD Mean Target</div><div class="value">{money_or_na(consensus_mean_display)}</div></div>
             <div class="card"><div class="label">YTD Median Target</div><div class="value">{money_or_na(consensus_median_display)}</div></div>
@@ -2526,7 +2612,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             <tr><th>Date</th><th>Analyst</th><th>Firm</th><th>Previous Rating</th><th>New Rating</th><th>Price Target</th></tr>
             {analyst_rows_html}
         </table>
-        <div class="note"><strong>Date policy:</strong> Individual rows and all four primary target cards are limited to {REPORT_YEAR}-01-01 through {escape(CURRENT_DATE)} and require an exact date plus public supporting URL. Missing individual targets remain N/A; no rolling or prior-year estimate is mixed into the YTD statistics.<br><br>{rolling_consensus_note}</div>
+        <div class="note"><strong>Date policy:</strong> Rows and all four primary target cards are limited to {REPORT_YEAR}-01-01 through {escape(CURRENT_DATE)} and require an exact date plus a public provider/supporting URL. Only the latest target-bearing action from each firm receives one vote, preventing frequent updaters from being overweighted. Missing targets remain N/A; no rolling or prior-year estimate is mixed into the YTD statistics.<br><br>{rolling_consensus_note}</div>
 
         <h2>3. Noise-Filtered Public Market Sentiment</h2>
         <div class="summary-grid">

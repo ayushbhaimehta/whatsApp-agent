@@ -3,6 +3,8 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
+
 from stock_intelligence import (
     aggregate_market_signal,
     author_reputation,
@@ -12,7 +14,9 @@ from stock_intelligence import (
     extract_current_year_analyst_targets,
     infer_ai_theme,
     lexical_sentiment,
+    memory_storage_valuation_policy,
     noise_penalty,
+    normalize_yahoo_analyst_history,
     parse_public_feed,
     relevance_score,
     score_market_items,
@@ -228,6 +232,64 @@ class StockIntelligenceTests(unittest.TestCase):
             source="Example", url="https://example.com/bloom-target",
         )], "BE", "Bloom Energy", 70, as_of=NOW)
         self.assertEqual(rows, [])
+
+    def test_sandisk_target_headline_variants_are_extracted_without_gemini(self):
+        rows = extract_current_year_analyst_targets([
+            item(
+                "BofA Raises SanDisk (SNDK) Price Target to $2,100, Keeps Buy Rating",
+                source="Yahoo Finance", url="https://finance.yahoo.com/sndk-bofa",
+            ),
+            item(
+                "Evercore ISI Adjusts Price Target on Sandisk Corporation to $3,100 From $1,400, Maintains Outperform Rating",
+                source="Moomoo", url="https://www.moomoo.com/sndk-evercore", days=2,
+            ),
+        ], "SNDK", "Sandisk Corporation", 1280, as_of=NOW)
+        self.assertEqual(len(rows), 2)
+        by_firm = {row["firm"]: row for row in rows}
+        self.assertEqual(by_firm["BofA"]["price_target"], 2100.0)
+        self.assertEqual(by_firm["Evercore ISI"]["price_target"], 3100.0)
+        self.assertEqual(by_firm["Evercore ISI"]["previous_price_target"], 1400.0)
+
+    def test_yahoo_dated_analyst_history_retains_targets_without_gemini(self):
+        frame = pd.DataFrame([
+            {
+                "GradeDate": "2026-08-05T17:24:02Z", "Firm": "Wells Fargo",
+                "ToGrade": "Equal-Weight", "FromGrade": "Equal-Weight",
+                "currentPriceTarget": 1400.0, "priorPriceTarget": 1620.0,
+            },
+            {
+                "GradeDate": "2026-08-05T15:47:36Z", "Firm": "Citigroup",
+                "ToGrade": "Buy", "FromGrade": "Buy",
+                "currentPriceTarget": 2100.0, "priorPriceTarget": 2500.0,
+            },
+            {
+                "GradeDate": "2025-12-01T12:00:00Z", "Firm": "Old Firm",
+                "ToGrade": "Buy", "currentPriceTarget": 900.0,
+            },
+        ]).set_index("GradeDate")
+        rows = normalize_yahoo_analyst_history(frame, "SNDK", as_of=NOW)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["price_target"], 1400.0)
+        self.assertEqual(rows[0]["previous_price_target"], 1620.0)
+        self.assertEqual(rows[1]["firm"], "Citigroup")
+        self.assertNotIn("token", rows[0]["source_url"].lower())
+        self.assertEqual(rows[0]["record_origin"], "Yahoo Finance provider feed")
+
+    def test_sandisk_uses_nand_peers_and_structural_forward_policy(self):
+        policy = memory_storage_valuation_policy(
+            "SNDK",
+            "Sandisk manufactures NAND flash and enterprise solid-state drives",
+        )
+        self.assertEqual(policy["subtype"], "NAND_FLASH")
+        self.assertEqual(policy["label"], "NAND Flash & Enterprise SSD")
+        self.assertNotIn("WDC", policy["peer_symbols"])
+        self.assertNotIn("STX", policy["peer_symbols"])
+        self.assertNotIn("SIMO", policy["peer_symbols"])
+        self.assertNotIn("RMBS", policy["peer_symbols"])
+        self.assertGreaterEqual(policy["terminal_margin_cap"], 0.45)
+        self.assertGreaterEqual(policy["structural_forward_eps_weight"], 0.70)
+        self.assertGreaterEqual(policy["structural_forward_pe_floor"], 6.0)
+        self.assertIn("Forward P/E", policy["weights"])
 
     def test_all_analyst_providers_share_ytd_source_firm_and_plausibility_boundary(self):
         base = {
