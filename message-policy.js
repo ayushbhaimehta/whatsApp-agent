@@ -6,7 +6,7 @@ const PURCHASE_LANGUAGE = /\b(?:buy|bring|purchase|order|get|pickup|pick\s+up|kh
 function isAgentGeneratedMessageBody(body) {
     const firstLine = String(body || '').split(/\r?\n/, 1)[0];
     return /\*(?:Personalized Meal Suggestions|Meals Logged|Added to Shopping List|Added to Google Tasks|Daily Summary|Stock report (?:status|ready(?::[^*]+)?|failed(?::[^*]+)?)|Scheduled stock reports(?: ready| failed)?|Complete stock reports(?: ready| failed)?|Monthly Budget Report(?:\s+—[^*]+)?|Budget report status|Scheduled budget (?:report|catch-up)(?: failed)?|Agent error|Voice-note error)\*/i
-        .test(firstLine);
+        .test(firstLine) || /\*Swiggy order history needs authorization\*/i.test(firstLine);
 }
 
 function getMessageCacheKey(msg) {

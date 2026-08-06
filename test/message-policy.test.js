@@ -37,6 +37,7 @@ test('recognizes formatted agent replies regardless of emoji encoding', () => {
     assert.equal(isAgentGeneratedMessageBody('📦 *Complete stock reports ready*\n\n14 completed, 0 failed.'), true);
     assert.equal(isAgentGeneratedMessageBody('ðŸ“¦ *Complete stock reports ready*\n\n14 completed, 0 failed.'), true);
     assert.equal(isAgentGeneratedMessageBody('📈 *Stock report status*\n\nQueued AMD.'), true);
+    assert.equal(isAgentGeneratedMessageBody('*Swiggy order history needs authorization*\n\nBudget reports will continue from SMS.'), true);
     assert.equal(isAgentGeneratedMessageBody('Stock report of the day'), false);
     assert.equal(isAgentGeneratedMessageBody('Macro summary'), false);
 });
