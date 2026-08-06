@@ -745,6 +745,8 @@ Vercel is not suitable for this application because WhatsApp Web needs one conti
 
 Follow the **[complete Oracle Cloud deployment guide](CLOUD_DEPLOYMENT.md)**. It includes every Windows and Ubuntu command, credential migration, remote Google/Swiggy authorization, WhatsApp QR pairing, Android companion changes, Tailscale Serve, updates, encrypted backup/restore, and zero-hosting-cost safeguards.
 
+If Oracle signup or capacity is unavailable, use the **[complete AWS Free Plan deployment guide](AWS_FREE_DEPLOYMENT.md)**. The same container runs on an EC2 `t4g.small` without application changes. AWS is easier to provision but is a temporary free option: the current T4g promotion ends on December 31, 2026, and a new AWS Free account plan ends after six months or when its credits are exhausted.
+
 After cloud cutover, stop the Windows copy. Running local and cloud listeners together can process the same message twice.
 
 ---

@@ -89,7 +89,7 @@ Stage the already tracked source updates plus the new, known-safe deployment fil
 
 ```powershell
 git add -u
-git add .dockerignore .env.cloud.example CLOUD_DEPLOYMENT.md Dockerfile budget-access-policy.js cloud-check.js compose.yaml runtime-paths.js test/budget-chat-guardrails.test.js test/runtime-paths.test.js
+git add .dockerignore .env.cloud.example AWS_FREE_DEPLOYMENT.md CLOUD_DEPLOYMENT.md Dockerfile budget-access-policy.js cloud-check.js compose.yaml runtime-paths.js test/budget-chat-guardrails.test.js test/runtime-paths.test.js
 git status
 git diff --cached --check
 git diff --cached --name-only
