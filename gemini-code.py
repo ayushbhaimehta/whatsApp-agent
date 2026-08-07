@@ -33,11 +33,20 @@ from datetime import datetime
 from html import escape
 from urllib.parse import urlparse
 from stock_intelligence import (
+    apply_directional_scenario_shift,
     build_market_intelligence,
+    complete_forward_revenue_path,
+    convert_currency_amount,
+    currency_pair_candidates,
     current_calendar_year,
     extract_current_year_analyst_targets,
+    filter_non_monotonic_scenario_methods,
     memory_storage_valuation_policy,
+    normalize_currency_code,
+    normalize_scenario_estimates,
     normalize_yahoo_analyst_history,
+    quote_equivalent_share_count,
+    robust_analyst_target_policy,
     validate_current_year_analyst_record,
 )
 try:
@@ -169,7 +178,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     quote_scale_factor = 1.0
     quote_scale_reason = (
         "Automatic quote scaling disabled; prices, history, analyst targets, market "
-        "capitalization and per-share estimates are used exactly as returned"
+        "capitalization and per-share estimates are used exactly as returned; "
+        "filing-currency monetary statements are normalized only through an "
+        "explicit market FX rate"
     )
     print(f"Market-data unit check: {quote_scale_reason}.")
     if current_price <= 0:
@@ -203,6 +214,68 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     def normalize_per_share_quote(value):
         """Compatibility helper: validate a per-share value without rescaling it."""
         return early_positive_float(value)
+
+
+    quote_currency = normalize_currency_code(
+        info.get("currency") or fmp_profile.get("currency")
+    )
+    if not quote_currency:
+        raise ValueError(
+            "The provider did not supply a valid quote currency; valuation cannot "
+            "safely infer monetary units."
+        )
+    # Do not assume that an ADR's filing currency matches its quote currency when
+    # Yahoo omits this field. Empty metadata deliberately disables statement-based
+    # monetary inputs while quote-basis price and market-cap fields remain usable.
+    financial_currency = normalize_currency_code(info.get("financialCurrency"))
+    _fx_rate_cache = {}
+
+
+    def market_fx_rate(source_currency, destination_currency):
+        """Return destination-currency units for one source-currency unit."""
+        source = normalize_currency_code(source_currency)
+        destination = normalize_currency_code(destination_currency)
+        if not source or not destination:
+            return None
+        if source == destination:
+            return 1.0
+        cache_key = (source, destination)
+        if cache_key in _fx_rate_cache:
+            return _fx_rate_cache[cache_key]
+        rate = None
+        for symbol, invert in currency_pair_candidates(source, destination):
+            try:
+                fx_history = yf.Ticker(symbol).history(period="5d", auto_adjust=False, repair=False)
+                raw_rate = float(fx_history["Close"].dropna().iloc[-1])
+                if math.isfinite(raw_rate) and raw_rate > 0:
+                    rate = (1.0 / raw_rate) if invert else raw_rate
+                    break
+            except Exception:
+                continue
+        _fx_rate_cache[cache_key] = rate
+        if rate is not None:
+            _fx_rate_cache[(destination, source)] = 1.0 / rate
+        return rate
+
+
+    financial_to_quote_rate = market_fx_rate(financial_currency, quote_currency)
+    cross_currency_financials = financial_currency != quote_currency
+    if cross_currency_financials and financial_to_quote_rate is None:
+        print(
+            f"WARNING: {financial_currency or 'UNKNOWN'}->{quote_currency} FX was unavailable. "
+            "Currency-dependent DCF/enterprise-value inputs will be omitted rather than mixed."
+        )
+    elif cross_currency_financials:
+        print(
+            f"Financial currency normalization: 1 {financial_currency} = "
+            f"{financial_to_quote_rate:.8f} {quote_currency}."
+        )
+
+
+    def to_quote_money(value, source_currency=None):
+        source = normalize_currency_code(source_currency or financial_currency)
+        rate = market_fx_rate(source, quote_currency)
+        return convert_currency_amount(value, source, quote_currency, rate)
 
     prev_high = hist_1y['High'].iloc[-2]
     prev_low = hist_1y['Low'].iloc[-2]
@@ -354,27 +427,42 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     )
 
     # --- FUNDAMENTAL METRICS ---
-    raw_market_cap = fmp_profile.get("mktCap") or info.get("marketCap", 10000000000)
+    raw_market_cap = early_positive_float(
+        fmp_profile.get("mktCap") or info.get("marketCap")
+    )
+    if not raw_market_cap:
+        provider_shares = early_positive_float(
+            info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+        )
+        raw_market_cap = current_price * provider_shares if provider_shares else None
+    if not raw_market_cap:
+        raise ValueError(
+            "A reliable market capitalization/share basis is required for per-share valuation."
+        )
     market_cap = raw_market_cap  # Never rescale provider market capitalization.
-    total_debt = info.get("totalDebt", 0)
-    total_cash = info.get("totalCash", 0)
+    total_debt = to_quote_money(info.get("totalDebt")) or 0
+    total_cash = to_quote_money(info.get("totalCash")) or 0
 
     if current_price and current_price > 0:
         shares_out = market_cap / current_price
     else:
-        shares_out = info.get("sharesOutstanding", 100000000)
+        shares_out = early_positive_float(
+            info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+        )
+        if not shares_out:
+            raise ValueError("A reliable share count is required for per-share valuation.")
 
     company_name = fmp_profile.get("companyName") or info.get('longName', TICKER_SYMBOL)
     industry = fmp_profile.get("industry") or info.get('industry', 'N/A')
     sector = fmp_profile.get("sector") or info.get('sector', 'N/A')
 
-    trailing_pe = info.get("trailingPE") or 15.0
-    fwd_pe = info.get("forwardPE") or 14.0
-    peg_ratio = info.get("pegRatio") or 1.0
-    ps_ratio = info.get("priceToSalesTrailing12Months") or 2.0
-    ev_ebitda = info.get("enterpriseToEbitda") or 10.0
-    debt_to_equity = info.get("debtToEquity") or 0.0
-    op_margin = info.get("operatingMargin") or info.get("operatingMargins") or 0.15
+    trailing_pe = positive_float(info.get("trailingPE"))
+    fwd_pe = positive_float(info.get("forwardPE"))
+    peg_ratio = positive_float(info.get("pegRatio"))
+    ps_ratio = positive_float(info.get("priceToSalesTrailing12Months"))
+    ev_ebitda = positive_float(info.get("enterpriseToEbitda"))
+    debt_to_equity = positive_float(info.get("debtToEquity"))
+    op_margin = info.get("operatingMargin") or info.get("operatingMargins")
 
     # =========================================================
     # 4. GEMINI CLIENT (ANALYST-SOURCE ENRICHMENT ONLY)
@@ -453,7 +541,12 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             if key in normalized:
                 series = pd.to_numeric(frame.loc[normalized[key]], errors="coerce").dropna()
                 series.index = pd.to_datetime(series.index, errors="coerce")
-                return series[~series.index.isna()]
+                series = series[~series.index.isna()]
+                if cross_currency_financials:
+                    if financial_to_quote_rate is None:
+                        return pd.Series(dtype="float64")
+                    series = series * financial_to_quote_rate
+                return series
         return pd.Series(dtype="float64")
 
 
@@ -483,7 +576,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     def aligned_ratio(numerator_series, denominator_series, low=None, high=None):
-        frame = pd.concat([numerator_series.rename("n"), denominator_series.rename("d")], axis=1).dropna()
+        frame = pd.concat(
+            [numerator_series.rename("n"), denominator_series.rename("d")],
+            axis=1,
+            sort=False,
+        ).dropna()
         if frame.empty:
             return pd.Series(dtype="float64")
         ratios = frame["n"] / frame["d"].replace(0, pd.NA)
@@ -534,20 +631,36 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     invested_capital_annual = statement_series(annual_balance, ["InvestedCapital"])
 
     # TTM figures use quarterly statements first, then Yahoo summary fields.
-    revenue_ttm = ttm_sum(quarterly_income, ["TotalRevenue", "OperatingRevenue"], positive_float(info.get("totalRevenue")))
+    revenue_ttm = ttm_sum(
+        quarterly_income,
+        ["TotalRevenue", "OperatingRevenue"],
+        to_quote_money(info.get("totalRevenue")),
+    )
     summary_operating_margin = info.get("operatingMargins") or info.get("operatingMargin")
     summary_ebit = (
         float(revenue_ttm) * float(summary_operating_margin)
         if revenue_ttm and summary_operating_margin is not None
-        else positive_float(info.get("ebitda"))
+        else to_quote_money(info.get("ebitda"))
     )
     ebit_ttm = ttm_sum(quarterly_income, ["EBIT", "OperatingIncome"], summary_ebit)
-    ebitda_ttm = ttm_sum(quarterly_income, ["EBITDA", "NormalizedEBITDA"], positive_float(info.get("ebitda")))
+    ebitda_ttm = ttm_sum(
+        quarterly_income,
+        ["EBITDA", "NormalizedEBITDA"],
+        to_quote_money(info.get("ebitda")),
+    )
     pretax_ttm = ttm_sum(quarterly_income, ["PretaxIncome", "IncomeBeforeTax"], None)
     tax_ttm = ttm_sum(quarterly_income, ["TaxProvision", "IncomeTaxExpense"], None)
     interest_ttm = abs(ttm_sum(quarterly_income, ["InterestExpense", "InterestExpenseNonOperating"], 0) or 0)
-    net_income_ttm = ttm_sum(quarterly_income, ["NetIncome", "NetIncomeCommonStockholders"], info.get("netIncomeToCommon"))
-    cfo_ttm = ttm_sum(quarterly_cash, ["OperatingCashFlow", "TotalCashFromOperatingActivities"], info.get("operatingCashflow"))
+    net_income_ttm = ttm_sum(
+        quarterly_income,
+        ["NetIncome", "NetIncomeCommonStockholders"],
+        to_quote_money(info.get("netIncomeToCommon")),
+    )
+    cfo_ttm = ttm_sum(
+        quarterly_cash,
+        ["OperatingCashFlow", "TotalCashFromOperatingActivities"],
+        to_quote_money(info.get("operatingCashflow")),
+    )
     capex_ttm = abs(ttm_sum(quarterly_cash, ["CapitalExpenditure", "CapitalExpenditures"], 0) or 0)
     da_ttm = ttm_sum(quarterly_cash, ["DepreciationAndAmortization", "Depreciation"], 0) or 0
     sbc_ttm = ttm_sum(quarterly_cash, ["StockBasedCompensation"], 0) or 0
@@ -612,10 +725,13 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     model_roic = clamp(normalized_roic if normalized_roic > 0 else 0.08, 0.04, 0.40)
 
     # Cash-flow and balance-sheet diagnostics.
-    fcf_ttm = (cfo_ttm - capex_ttm) if cfo_ttm is not None else info.get("freeCashflow")
+    fcf_ttm = (
+        (cfo_ttm - capex_ttm)
+        if cfo_ttm is not None else to_quote_money(info.get("freeCashflow"))
+    )
     fcff_ttm = (
         cfo_ttm + interest_ttm * (1 - effective_tax_rate) - capex_ttm
-        if cfo_ttm is not None else info.get("freeCashflow")
+        if cfo_ttm is not None else to_quote_money(info.get("freeCashflow"))
     )
     fcf_margin = safe_ratio(fcf_ttm, revenue_ttm, None)
     cash_conversion = safe_ratio(cfo_ttm, net_income_ttm, None) if net_income_ttm and net_income_ttm > 0 else None
@@ -715,11 +831,13 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     # AI-value-chain independent valuation architecture
     # -----------------------------------------------------------------------------
     # Non-negotiable invariant:
-    #   Analyst PRICE TARGETS are never used in the valuation calculation.
+    #   Analyst PRICE TARGETS never alter the independent valuation component.
     # Near-term analyst OPERATING estimates (revenue/EPS) may be used for FY1/FY2
     # after sanity checks and shrinkage toward company history and peer fundamentals.
     # This mirrors the information set used by sell-side analysts without copying
-    # their valuation conclusion.
+    # their valuation conclusion. After all current-year analyst rows are
+    # validated, a separately labelled 12-month objective may apply a bounded,
+    # outlier-filtered Street calibration while preserving this independent value.
     USE_ANALYST_PRICE_TARGETS_IN_VALUATION = False
     USE_ANALYST_OPERATING_ESTIMATES = True
     MANUAL_ARCHETYPE = None  # Example: "MEMORY_STORAGE"; leave None for auto-classification.
@@ -882,7 +1000,27 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     def estimate_value(frame, period, column, default=None):
-        return frame_cell(frame, period, column, default)
+        value = frame_cell(frame, period, column, default)
+        if value is None:
+            return default
+        try:
+            source_currency = normalize_currency_code(frame.loc[period, "currency"])
+        except Exception:
+            source_currency = ""
+        if not source_currency:
+            print(
+                f"Estimate currency note: omitted {period}/{column} because "
+                "the provider supplied no valid currency metadata."
+            )
+            return default
+        rate = market_fx_rate(source_currency, quote_currency)
+        if rate is None:
+            print(
+                f"Estimate currency note: omitted {period}/{column} because "
+                f"{source_currency or 'unknown'}->{quote_currency} FX is unavailable."
+            )
+            return default
+        return value * rate
 
 
     def plausible_estimate(value, reference=None, low_factor=0.25, high_factor=4.0):
@@ -929,21 +1067,48 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     eps_1y_low = normalize_per_share_quote(estimate_value(earnings_estimates, "+1y", "low"))
     eps_1y_high = normalize_per_share_quote(estimate_value(earnings_estimates, "+1y", "high"))
 
-    reported_shares = positive_float(info.get("sharesOutstanding")) or shares_out
-    implied_market_cap = current_price * reported_shares
-    if market_cap and implied_market_cap:
-        mcap_ratio = market_cap / implied_market_cap
-        if not 0.75 <= mcap_ratio <= 1.25:
+    rev_0y_low, rev_0y_avg, rev_0y_high = normalize_scenario_estimates(
+        rev_0y_low, rev_0y_avg, rev_0y_high
+    )
+    rev_1y_low, rev_1y_avg, rev_1y_high = normalize_scenario_estimates(
+        rev_1y_low, rev_1y_avg, rev_1y_high
+    )
+    eps_0y_low, eps_0y_avg, eps_0y_high = normalize_scenario_estimates(
+        eps_0y_low, eps_0y_avg, eps_0y_high
+    )
+    eps_1y_low, eps_1y_avg, eps_1y_high = normalize_scenario_estimates(
+        eps_1y_low, eps_1y_avg, eps_1y_high
+    )
+
+    reported_shares = positive_float(
+        info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+    )
+    quote_equivalent_shares = quote_equivalent_share_count(
+        market_cap, current_price, reported_shares
+    )
+    if not quote_equivalent_shares:
+        raise ValueError("Could not establish a quote-consistent ADR/share basis.")
+    if reported_shares:
+        implied_shares = market_cap / current_price
+        share_ratio = reported_shares / implied_shares
+        if not 0.75 <= share_ratio <= 1.25:
             print(
-                "WARNING: marketCap is inconsistent with price x shares. "
-                "Using price x shares for internally consistent valuation; no field was rescaled."
+                "WARNING: provider shares are inconsistent with quote-currency "
+                "market cap / price. Using market cap / price as the ADR/share basis."
             )
-            market_cap = implied_market_cap
-    shares_out = reported_shares
+    shares_out = quote_equivalent_shares
     share_count = shares_out
-    minority_interest = positive_float(info.get("minorityInterest")) or 0.0
-    preferred_stock = positive_float(info.get("preferredStock")) or 0.0
-    enterprise_value_current = max(market_cap + latest_debt - latest_cash, 1.0)
+    minority_interest = to_quote_money(info.get("minorityInterest")) or 0.0
+    preferred_stock = to_quote_money(info.get("preferredStock")) or 0.0
+    enterprise_value_current = max(
+        market_cap + latest_debt + minority_interest + preferred_stock - latest_cash,
+        1.0,
+    )
+    # Recompute the subject's monetary multiples from normalized components.
+    # Yahoo's ready-made ratios can mix a USD ADR market value with TWD/EUR
+    # statements, which was the principal source of TSM's previous distortion.
+    ps_ratio = safe_ratio(market_cap, revenue_ttm, None)
+    ev_ebitda = safe_ratio(enterprise_value_current, ebitda_ttm, None)
 
 
     def classify_ai_archetype():
@@ -1038,22 +1203,47 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             peer_info = peer.info or {}
             peer_price = positive_float(peer_info.get("currentPrice") or peer_info.get("regularMarketPrice"))
             peer_market_cap = positive_float(peer_info.get("marketCap"))
-            peer_ev = positive_float(peer_info.get("enterpriseValue"))
-            peer_revenue = positive_float(peer_info.get("totalRevenue"))
-            peer_ebitda = positive_float(peer_info.get("ebitda"))
-            peer_fcf = positive_float(peer_info.get("freeCashflow"))
+            peer_quote_currency = normalize_currency_code(peer_info.get("currency"))
+            peer_financial_currency = normalize_currency_code(
+                peer_info.get("financialCurrency")
+            )
+            peer_rate = market_fx_rate(peer_financial_currency, peer_quote_currency)
+
+            def peer_money(value):
+                value = positive_float(value)
+                return value * peer_rate if value is not None and peer_rate is not None else None
+
+            peer_revenue = peer_money(peer_info.get("totalRevenue"))
+            peer_ebitda = peer_money(peer_info.get("ebitda"))
+            peer_fcf = peer_money(peer_info.get("freeCashflow"))
+            peer_cash = peer_money(peer_info.get("totalCash")) or 0.0
+            peer_debt = peer_money(peer_info.get("totalDebt")) or 0.0
+            peer_minority = peer_money(peer_info.get("minorityInterest")) or 0.0
+            peer_preferred = peer_money(peer_info.get("preferredStock")) or 0.0
+            # Reconstruct EV in the quote currency. Provider enterpriseValue can
+            # lag its quote or remain in the filing currency for foreign ADRs.
+            peer_ev = (
+                max(
+                    peer_market_cap + peer_debt + peer_minority
+                    + peer_preferred - peer_cash,
+                    1.0,
+                )
+                if peer_market_cap is not None and peer_rate is not None else None
+            )
+            derived_ev_ebitda = safe_ratio(peer_ev, peer_ebitda, None)
             snapshot = {
                 "ticker": symbol,
                 "price": peer_price,
                 "market_cap": peer_market_cap,
                 "forward_pe": positive_float(peer_info.get("forwardPE")),
-                "ev_ebitda": positive_float(peer_info.get("enterpriseToEbitda")),
+                "ev_ebitda": derived_ev_ebitda,
                 "ev_sales": safe_ratio(peer_ev, peer_revenue, None),
                 "ev_fcf": safe_ratio(peer_ev, peer_fcf, None),
                 "growth": peer_info.get("revenueGrowth"),
                 "operating_margin": peer_info.get("operatingMargins") or peer_info.get("operatingMargin"),
                 "fcf_margin": safe_ratio(peer_fcf, peer_revenue, None),
                 "beta": positive_float(peer_info.get("beta")) or 1.0,
+                "unit_status": "normalized" if peer_rate is not None else "unresolved",
             }
             _peer_cache[symbol] = snapshot
             return snapshot
@@ -1091,6 +1281,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     peer_data = [peer_snapshot(symbol) for symbol in peer_symbols]
     peer_data = [item for item in peer_data if item]
     peer_count = len(peer_data)
+    normalized_peer_count = sum(
+        1 for item in peer_data if item.get("unit_status") == "normalized"
+    )
 
     peer_forward_pe = median_valid(peer_data, "forward_pe", 3.0, 100.0, None)
     peer_ev_ebitda = median_valid(peer_data, "ev_ebitda", 2.0, 80.0, None)
@@ -1151,10 +1344,30 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     forward_revenue_year1 = blend_estimate(rev_0y_avg, standalone_rev_1, operating_estimate_weight)
     forward_revenue_year2 = blend_estimate(rev_1y_avg, standalone_rev_2, operating_estimate_weight)
-    if forward_revenue_year1 is None:
-        forward_revenue_year1 = revenue_ttm
-    if forward_revenue_year2 is None:
-        forward_revenue_year2 = forward_revenue_year1 * (1 + standalone_growth_anchor)
+    forward_revenue_year1, forward_revenue_year2 = complete_forward_revenue_path(
+        forward_revenue_year1,
+        forward_revenue_year2,
+        revenue_ttm,
+        standalone_growth_anchor,
+    )
+
+    scenario_revenue_year1 = {
+        "Bear": blend_estimate(rev_0y_low, standalone_rev_1, operating_estimate_weight),
+        "Base": forward_revenue_year1,
+        "Bull": blend_estimate(rev_0y_high, standalone_rev_1, operating_estimate_weight),
+    }
+    scenario_revenue_year2 = {
+        "Bear": blend_estimate(rev_1y_low, standalone_rev_2, operating_estimate_weight),
+        "Base": forward_revenue_year2,
+        "Bull": blend_estimate(rev_1y_high, standalone_rev_2, operating_estimate_weight),
+    }
+    for scenario_map in (scenario_revenue_year1, scenario_revenue_year2):
+        bear_value, base_value, bull_value = normalize_scenario_estimates(
+            scenario_map.get("Bear"),
+            scenario_map.get("Base"),
+            scenario_map.get("Bull"),
+        )
+        scenario_map.update(Bear=bear_value, Base=base_value, Bull=bull_value)
 
     # Reject EPS estimates that imply an impossible period-matched net margin. Never
     # repair them with a power-of-ten conversion.
@@ -1172,6 +1385,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     # Sandisk's high-margin NAND estimates and removed the forward valuation leg.
     forward_eps_year1 = validated_eps(eps_0y_avg, rev_0y_avg or forward_revenue_year1)
     forward_eps_year2 = validated_eps(eps_1y_avg, rev_1y_avg or forward_revenue_year2)
+    forward_eps_year2_low = validated_eps(
+        eps_1y_low,
+        rev_1y_low or scenario_revenue_year2.get("Bear") or forward_revenue_year2,
+    )
+    forward_eps_year2_high = validated_eps(
+        eps_1y_high,
+        rev_1y_high or scenario_revenue_year2.get("Bull") or forward_revenue_year2,
+    )
     if forward_eps_year2 is None:
         forward_eps_year2 = validated_eps(info.get("forwardEps"), forward_revenue_year2)
 
@@ -1184,6 +1405,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         0.18 if valuation_archetype_id != "MEMORY_STORAGE" else 0.12,
     )
     target_date_revenue = forward_revenue_year2 * (1 + target_date_growth_roll) if forward_revenue_year2 else None
+
+
+    def scenario_target_date_revenue(name):
+        revenue = scenario_revenue_year2.get(name) or forward_revenue_year2
+        return revenue * (1 + target_date_growth_roll) if revenue else None
+
+
+    eps_roll = 0.0
     if forward_eps_year2 is not None:
         eps_roll = target_date_growth_roll
         if valuation_archetype_id == "MEMORY_STORAGE":
@@ -1191,6 +1420,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         target_date_eps = forward_eps_year2 * (1 + eps_roll)
     else:
         target_date_eps = None
+
+    revision_adjustment = clamp(revision_breadth or 0.0, -1.0, 1.0) * 0.03
 
 
     def eps_implied_ebit_margin(eps_value, revenue_value):
@@ -1207,16 +1438,25 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     forward_margin_year1 = eps_implied_ebit_margin(forward_eps_year1, forward_revenue_year1)
     forward_margin_year2 = eps_implied_ebit_margin(forward_eps_year2, forward_revenue_year2)
 
+    memory_structural_transition = bool(
+        memory_policy
+        and memory_policy.get("subtype") in {"NAND_FLASH", "DIVERSIFIED_MEMORY"}
+        and forward_eps_year2 is not None
+        and rev_0y_avg is not None
+        and rev_1y_avg is not None
+        and safe_ratio(rev_1y_avg, rev_0y_avg, 1.0) - 1.0 > 0.10
+        and operating_estimate_count >= 5
+    )
+
     # Normalized margin depends on the economics of the specific AI sub-sector.
     # Cyclical memory uses a mid-cycle margin; scalable platforms use a peer-informed
     # mature margin; early-stage infrastructure uses a credible margin-ramp endpoint.
     historical_margin_anchor = normalized_ebit_margin
     peer_margin_anchor = peer_operating_margin if peer_operating_margin is not None else historical_margin_anchor
-    if valuation_archetype_id == "MEMORY_STORAGE" and memory_policy and memory_policy.get("subtype") == "NAND_FLASH":
-        # NAND contracts and enterprise-SSD mix can create a structural earnings
-        # transition that old carve-out history does not represent. Keep a sizable
-        # mid-cycle/historical anchor, while admitting period-matched forward
-        # operating evidence after its independent sanity check.
+    if valuation_archetype_id == "MEMORY_STORAGE" and memory_structural_transition:
+        # HBM/DRAM and enterprise-NAND mix can create a structural earnings
+        # transition that trailing cycle history does not represent. Keep a
+        # mid-cycle anchor while admitting period-matched forward evidence.
         forward_margin_anchor = finite_median(
             [forward_margin_year1, forward_margin_year2],
             current_operating_margin or historical_margin_anchor,
@@ -1228,7 +1468,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             + 0.35 * forward_margin_anchor
         )
     elif valuation_archetype_id == "MEMORY_STORAGE":
-        target_operating_margin = 0.65 * historical_margin_anchor + 0.35 * peer_margin_anchor
+        target_operating_margin = (
+            0.50 * historical_margin_anchor
+            + 0.25 * peer_margin_anchor
+            + 0.25 * (current_operating_margin or historical_margin_anchor)
+        )
     elif high_growth_stage or valuation_archetype_id in {"AI_CLOUD_INFRA", "AI_SOFTWARE"}:
         target_operating_margin = 0.25 * max(current_operating_margin or 0.0, 0.0) + 0.75 * peer_margin_anchor
     elif valuation_archetype_id == "MEGA_CAP_PLATFORM":
@@ -1283,10 +1527,27 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         params = scenario_parameters(name)
         years = config["forecast_years"]
         rev0 = revenue_ttm or forward_revenue_year1
-        g1 = safe_ratio(forward_revenue_year1, rev0, 1.0) - 1.0 if rev0 else standalone_growth_anchor
-        g2 = safe_ratio(forward_revenue_year2, forward_revenue_year1, 1.0) - 1.0 if forward_revenue_year1 else standalone_growth_anchor
-        g1 = clamp(g1 * (1 + params["growth_shift"]), -0.25, config["growth_cap"])
-        g2 = clamp(g2 * (1 + params["growth_shift"]), -0.20, config["growth_cap"])
+        selected_rev1 = scenario_revenue_year1.get(name) or forward_revenue_year1
+        selected_rev2 = scenario_revenue_year2.get(name) or forward_revenue_year2
+        g1 = safe_ratio(selected_rev1, rev0, 1.0) - 1.0 if rev0 else standalone_growth_anchor
+        g2 = safe_ratio(selected_rev2, selected_rev1, 1.0) - 1.0 if selected_rev1 else standalone_growth_anchor
+        g1 += revision_adjustment
+        g2 += revision_adjustment
+        # When provider low/high ranges already distinguish the scenario, retain
+        # a smaller independent stress so uncertainty is not double counted.
+        range_supplied = (
+            (name == "Bear" and rev_0y_low is not None and rev_1y_low is not None)
+            or (name == "Bull" and rev_0y_high is not None and rev_1y_high is not None)
+        )
+        scenario_shift = params["growth_shift"] * (0.35 if range_supplied else 1.0)
+        g1 = clamp(
+            apply_directional_scenario_shift(g1, scenario_shift),
+            -0.25, config["growth_cap"],
+        )
+        g2 = clamp(
+            apply_directional_scenario_shift(g2, scenario_shift),
+            -0.20, config["growth_cap"],
+        )
         terminal_g = clamp(terminal_growth, 0.015, min(0.035, wacc - 0.025))
         path = [g1, g2]
         for year in range(3, years + 1):
@@ -1305,7 +1566,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         if base_start is None:
             base_start = current_operating_margin if current_operating_margin is not None else historical_margin_anchor
         second = forward_margin_year2 if forward_margin_year2 is not None else base_start
-        target = target_operating_margin * (1 + params["margin_shift"])
+        target = apply_directional_scenario_shift(
+            target_operating_margin, params["margin_shift"]
+        )
         target = clamp(target, -0.20, config["terminal_margin_cap"])
 
         if valuation_archetype_id == "MEMORY_STORAGE":
@@ -1316,7 +1579,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         else:
             normalization_year = min(5, years)
 
-        path = [clamp(base_start, -0.35, 0.70), clamp(second, -0.35, 0.70)]
+        near_term_margin_cap = (
+            memory_policy.get("forward_ebit_margin_cap", 0.70)
+            if memory_policy else 0.70
+        )
+        path = [
+            clamp(base_start, -0.35, near_term_margin_cap),
+            clamp(second, -0.35, near_term_margin_cap),
+        ]
         for year in range(3, years + 1):
             if year <= normalization_year:
                 margin = interpolate(path[1], target, year - 2, normalization_year - 2)
@@ -1439,20 +1709,16 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     relative_factor = relative_adjustment()
 
-    nand_structural_transition = bool(
-        memory_policy
-        and memory_policy.get("subtype") == "NAND_FLASH"
-        and forward_eps_year2 is not None
-        and rev_0y_avg is not None
-        and rev_1y_avg is not None
-        and safe_ratio(rev_1y_avg, rev_0y_avg, 1.0) - 1.0 > 0.10
-        and operating_estimate_count >= 5
-    )
-
-
     def scenario_forward_eps(name):
         params = scenario_parameters(name)
-        base = target_date_eps or forward_eps_year2 or forward_eps_year1
+        selected_eps = (
+            forward_eps_year2_low if name == "Bear"
+            else forward_eps_year2_high if name == "Bull"
+            else forward_eps_year2
+        )
+        if selected_eps is not None:
+            selected_eps *= 1 + eps_roll
+        base = selected_eps or target_date_eps or forward_eps_year2 or forward_eps_year1
         if base is None:
             # Derive EPS from normalized operating economics when sell-side EPS is unusable.
             revenue = forward_revenue_year2 or forward_revenue_year1
@@ -1462,7 +1728,19 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
                 base = net_income / max(share_count, 1.0)
         if base is None:
             return None
-        return max(base * (1 + 0.65 * params["growth_shift"] + 0.55 * params["margin_shift"]), 0.0)
+        range_supplied = (
+            (name == "Bear" and forward_eps_year2_low is not None)
+            or (name == "Bull" and forward_eps_year2_high is not None)
+        )
+        stress_scale = 0.25 if range_supplied else 1.0
+        scenario_multiplier = (
+            1
+            + revision_adjustment
+            + stress_scale * (
+                0.65 * params["growth_shift"] + 0.55 * params["margin_shift"]
+            )
+        )
+        return max(base * scenario_multiplier, 0.0)
 
 
     def forward_pe_value(name):
@@ -1488,7 +1766,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         multiple *= 1 + scenario_parameters(name)["multiple_shift"]
         multiple_floor = (
             memory_policy.get("structural_forward_pe_floor", 4.0)
-            if nand_structural_transition else 4.0
+            if memory_structural_transition else 4.0
         )
         return eps * clamp(multiple, multiple_floor, 90.0)
 
@@ -1518,7 +1796,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         )
         forward_weight = (
             memory_policy.get("structural_forward_eps_weight", 0.75)
-            if nand_structural_transition else 0.65 if structural_upcycle else 0.45
+            if memory_structural_transition else 0.65 if structural_upcycle else 0.45
         )
         if forward_growth < 0 or (forward_margin_year2 is not None and forward_margin_year2 < target_operating_margin):
             forward_weight = 0.25
@@ -1530,27 +1808,43 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         # Mid-cycle multiples should not capitalize peak growth indefinitely.
         multiple_floor = (
             memory_policy.get("structural_normalized_pe_floor", 6.0)
-            if nand_structural_transition else 6.0
+            if memory_structural_transition else 6.0
         )
-        multiple = clamp(base_multiple * relative_factor, multiple_floor, 28.0)
-        multiple *= 1 + params["multiple_shift"]
+        multiple = clamp(
+            base_multiple * relative_factor * (1 + params["multiple_shift"]),
+            multiple_floor,
+            28.0,
+        )
         return valuation_eps * multiple
 
 
     def forward_ebitda_value(name):
-        revenue = target_date_revenue or forward_revenue_year2 or forward_revenue_year1
+        revenue = (
+            scenario_target_date_revenue(name)
+            or target_date_revenue
+            or forward_revenue_year2
+            or forward_revenue_year1
+        )
         if not revenue:
             return None
         params = scenario_parameters(name)
         base_ebit_margin = target_operating_margin
         if valuation_archetype_id == "MEMORY_STORAGE" and forward_margin_year2 is not None:
             base_ebit_margin = 0.60 * forward_margin_year2 + 0.40 * target_operating_margin
-        ebit_margin = clamp(base_ebit_margin * (1 + params["margin_shift"]), -0.20, 0.65)
+        forward_margin_cap = (
+            memory_policy.get("forward_ebit_margin_cap", 0.65)
+            if memory_policy else 0.65
+        )
+        ebit_margin = clamp(
+            apply_directional_scenario_shift(base_ebit_margin, params["margin_shift"]),
+            -0.20,
+            forward_margin_cap,
+        )
         ebitda_margin = ebit_margin + normalized_da_margin
         if ebitda_margin <= 0.01:
             return None
         ebitda = revenue * ebitda_margin
-        observed = positive_float(info.get("enterpriseToEbitda"))
+        observed = positive_float(ev_ebitda)
         candidates = []
         if peer_ev_ebitda:
             candidates.append((peer_ev_ebitda * relative_factor, 0.65))
@@ -1574,7 +1868,12 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     def forward_sales_value(name):
-        revenue = target_date_revenue or forward_revenue_year2 or forward_revenue_year1
+        revenue = (
+            scenario_target_date_revenue(name)
+            or target_date_revenue
+            or forward_revenue_year2
+            or forward_revenue_year1
+        )
         if not revenue:
             return None
         params = scenario_parameters(name)
@@ -1601,7 +1900,12 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     def forward_fcf_value(name):
-        revenue = target_date_revenue or forward_revenue_year2 or forward_revenue_year1
+        revenue = (
+            scenario_target_date_revenue(name)
+            or target_date_revenue
+            or forward_revenue_year2
+            or forward_revenue_year1
+        )
         if not revenue:
             return None
         params = scenario_parameters(name)
@@ -1665,14 +1969,34 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     scenario_method_values = {}
-    scenario_raw_method_values = {}
+    scenario_plausible_method_values = {}
+    scenario_raw_method_values = {
+        scenario_name: method_values(scenario_name)
+        for scenario_name in ["Bear", "Base", "Bull"]
+    }
+    ordered_method_values, monotonic_rejections = (
+        filter_non_monotonic_scenario_methods(scenario_raw_method_values)
+    )
+    scenario_rejected_methods = {
+        name: dict(monotonic_rejections.get(name) or {})
+        for name in ["Bear", "Base", "Bull"]
+    }
     scenario_values = {}
     for scenario_name in ["Bear", "Base", "Bull"]:
-        raw_values = method_values(scenario_name)
-        scenario_raw_method_values[scenario_name] = raw_values
+        raw_values = ordered_method_values[scenario_name]
+        plausible_values = {
+            method: value
+            for method, value in raw_values.items()
+            if current_price * 0.05 <= value <= current_price * 6.0
+        }
+        scenario_rejected_methods[scenario_name].update({
+            method: value for method, value in raw_values.items()
+            if method not in plausible_values
+        })
         composite, used_values = robust_weighted_composite(
-            raw_values, config["weights"], config["outlier_band"]
+            plausible_values, config["weights"], config["outlier_band"]
         )
+        scenario_plausible_method_values[scenario_name] = plausible_values
         scenario_method_values[scenario_name] = used_values
         scenario_values[scenario_name] = composite
 
@@ -1683,6 +2007,20 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             for name, value in scenario_raw_method_values.get("Base", {}).items()
         )
     )
+    if scenario_rejected_methods.get("Base"):
+        print(
+            "WARNING: dimensionally implausible base methods excluded: "
+            + ", ".join(
+                f"{name}=${value:,.2f}"
+                for name, value in scenario_rejected_methods["Base"].items()
+            )
+        )
+    for scenario_name in ("Bear", "Bull"):
+        if monotonic_rejections.get(scenario_name):
+            print(
+                f"WARNING: non-monotonic {scenario_name.lower()} methods excluded: "
+                + ", ".join(monotonic_rejections[scenario_name])
+            )
 
     intrinsic_value = scenario_values.get("Base")
     bear_price = scenario_values.get("Bear")
@@ -1732,7 +2070,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     # Confidence comes from source quality and agreement among independent methods,
     # not from closeness to Wall Street.
-    base_methods = scenario_method_values.get("Base", {})
+    base_methods = scenario_plausible_method_values.get("Base", {})
     method_dispersion = None
     if len(base_methods) >= 2:
         method_series = pd.Series(list(base_methods.values()), dtype="float64")
@@ -1744,7 +2082,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         data_quality_score += 0.13
     if share_count and share_count > 0:
         data_quality_score += 0.08
-    if peer_count >= 3:
+    if normalized_peer_count >= 3:
         data_quality_score += 0.12
     if len(base_methods) >= 2:
         data_quality_score += 0.12
@@ -1752,6 +2090,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         data_quality_score += 0.08
     if method_dispersion is not None:
         data_quality_score -= clamp(method_dispersion - 0.20, 0.0, 0.25)
+    rejected_base_count = len(scenario_rejected_methods.get("Base", {}))
+    if rejected_base_count:
+        data_quality_score -= min(0.18, rejected_base_count * 0.05)
     model_confidence = int(clamp(round(data_quality_score * 100), 35, 92))
 
     street_comparison = (
@@ -1760,9 +2101,10 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     )
 
     print(
-        f"Architecture: {valuation_archetype}; peers={peer_count}; "
+        f"Architecture: {valuation_archetype}; peers={peer_count} "
+        f"({normalized_peer_count} currency-normalized); "
         f"operating-estimate weight={operating_estimate_weight:.0%}; "
-        f"analyst-target weight=0%; independent fair value=${intrinsic_value:,.2f}; "
+        f"pre-calibration analyst-target weight=0%; independent fair value=${intrinsic_value:,.2f}; "
         f"Street comparison={street_comparison}."
     )
 
@@ -1942,6 +2284,46 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     }
 
 
+    def grounded_model_candidates():
+        configured = os.environ.get("STOCK_GEMINI_MODELS", "").strip()
+        values = [value.strip() for value in configured.split(",") if value.strip()]
+        preferred = os.environ.get("GEMINI_MODEL", "").strip()
+        if preferred:
+            values.insert(0, preferred)
+        values.extend(["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"])
+        return list(dict.fromkeys(values))
+
+
+    def create_grounded_interaction(prompt, schema):
+        """Try configured grounding-capable models without starving the batch."""
+        errors = []
+        for model_name in grounded_model_candidates():
+            try:
+                interaction = client.interactions.create(
+                    model=model_name,
+                    input=prompt,
+                    tools=[{"type": "google_search"}],
+                    response_format={
+                        "type": "text",
+                        "mime_type": "application/json",
+                        "schema": schema,
+                    },
+                )
+                print(f"Gemini grounded analyst search succeeded with {model_name}.")
+                return interaction
+            except Exception as exc:
+                message = str(exc)
+                errors.append(f"{model_name}: {type(exc).__name__}: {message}")
+                retryable = any(marker in message.lower() for marker in (
+                    "429", "resource_exhausted", "too_many_requests", "503",
+                    "service unavailable", "high demand", "unavailable",
+                ))
+                if not retryable:
+                    raise
+                print(f"Gemini grounding fallback after {model_name}: {message[:240]}")
+        raise RuntimeError("All grounded analyst models failed: " + " | ".join(errors))
+
+
     def fetch_grounded_analyst_records():
         """Use Gemini Interactions API + Google Search to produce sourced firm-level rows."""
         global _GEMINI_GROUNDING_DISABLED, _GEMINI_GROUNDING_DISABLE_REASON
@@ -1991,16 +2373,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
                     "Re-run the installation cell, then restart the Colab runtime once."
                 )
 
-            interaction = client.interactions.create(
-                model="gemini-3.6-flash",
-                input=prompt,
-                tools=[{"type": "google_search"}],
-                response_format={
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": ANALYST_FEED_SCHEMA,
-                },
-            )
+            interaction = create_grounded_interaction(prompt, ANALYST_FEED_SCHEMA)
             raw_text = interaction.output_text or ""
             if not raw_text.strip():
                 print("Gemini Search returned no text.")
@@ -2124,16 +2497,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
         print("Starting dedicated Gemini Search for numeric analyst price targets...")
         try:
-            interaction = client.interactions.create(
-                model="gemini-3.6-flash",
-                input=prompt,
-                tools=[{"type": "google_search"}],
-                response_format={
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": TARGET_ONLY_SCHEMA,
-                },
-            )
+            interaction = create_grounded_interaction(prompt, TARGET_ONLY_SCHEMA)
             payload = json.loads(interaction.output_text or "{}")
         except Exception as exc:
             message = str(exc)
@@ -2258,8 +2622,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         if normalized and is_verifiable_current_year_action(normalized):
             analyst_records.append(normalized)
 
-    # Run both searches: one broad rating/action pass and one stricter numeric-target pass.
-    grounded_records = fetch_grounded_analyst_records()
+    # Yahoo supplies deterministic rating history. Use one target-specific Gemini
+    # pass per ticker instead of two calls, preserving scarce grounding quota.
+    grounded_records = []
     target_records = fetch_grounded_target_records()
     yahoo_records = fetch_yahoo_fallback_records()
     public_feed_target_records = extract_current_year_analyst_targets(
@@ -2386,6 +2751,52 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         normalize_per_share_quote(yahoo_price_targets.get("low"))
         or normalize_per_share_quote(info.get("targetLowPrice"))
         if published_consensus_available else None
+    )
+
+    # The independent valuation remains fully visible. The report's primary
+    # 12-month objective is calibrated with a bounded, one-firm-one-vote Street
+    # anchor only after current-year records have been validated and deduplicated.
+    analyst_target_policy = robust_analyst_target_policy(
+        current_price,
+        intrinsic_value,
+        verified_targets=collected_target_values,
+        rolling_mean=rolling_consensus_mean,
+        rolling_median=rolling_consensus_median,
+        rolling_low=rolling_consensus_low,
+        rolling_high=rolling_consensus_high,
+        opinion_count=consensus_analyst_count or 0,
+        archetype=valuation_archetype_id,
+    )
+    research_price_objective = analyst_target_policy["objective"] or intrinsic_value
+    analyst_target_weight = float(analyst_target_policy["weight"] or 0.0)
+    fundamental_target = research_price_objective
+    objective_upside = safe_ratio(
+        research_price_objective - current_price, current_price, 0.0
+    )
+    if objective_upside >= 0.25:
+        model_rating, rating_class = "STRONG BUY", "buy"
+    elif objective_upside >= 0.10:
+        model_rating, rating_class = "BUY", "buy"
+    elif objective_upside > -0.10:
+        model_rating, rating_class = "HOLD", "hold"
+    else:
+        model_rating, rating_class = "SELL", "sell"
+    accumulation_zone = research_price_objective * 0.85
+    high_conviction_zone = min(research_price_objective * 0.75, fair_value_low * 0.95)
+    methodology = (
+        f"Evidence-Calibrated {valuation_archetype} Composite"
+        if analyst_target_weight > 0 else f"Independent {valuation_archetype} Composite"
+    )
+    if cross_currency_financials and financial_to_quote_rate is None:
+        model_confidence = min(model_confidence, 40)
+    if len(scenario_method_values.get("Base", {})) < 2:
+        model_confidence = min(model_confidence, 48)
+    print(
+        f"Final 12-month objective=${research_price_objective:,.2f}; "
+        f"independent=${intrinsic_value:,.2f}; analyst anchor="
+        f"{fmt_money(analyst_target_policy.get('anchor'))}; "
+        f"analyst weight={analyst_target_weight:.0%}; "
+        f"reliability={analyst_target_policy.get('reliability', 0):.0%}."
     )
 
     def money_or_na(value):
@@ -2518,6 +2929,34 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         if published_consensus_available else
         "<strong>Supplemental rolling provider snapshot:</strong> unavailable."
     )
+    currency_unit_note = (
+        f"Financial statements and revenue estimates were converted from {financial_currency} "
+        f"to {quote_currency} at {financial_to_quote_rate:.8f} {quote_currency} per {financial_currency}; "
+        "per-share valuation uses quote-currency market capitalization divided by the current ADR/share price."
+        if cross_currency_financials and financial_to_quote_rate is not None
+        else "Quote and financial-statement currencies match; no FX conversion was required."
+        if not cross_currency_financials
+        else "Financial-statement FX was unresolved; currency-dependent methods were omitted and confidence was capped."
+    )
+    analyst_count_parts = []
+    if analyst_target_policy.get("verified_count"):
+        analyst_count_parts.append(
+            f"{analyst_target_policy['verified_count']} verified current-year firm target(s)"
+        )
+    if (
+        "rolling" in analyst_target_policy.get("source", "")
+        and analyst_target_policy.get("provider_opinion_count")
+    ):
+        analyst_count_parts.append(
+            f"provider-reported rolling opinion count "
+            f"{analyst_target_policy['provider_opinion_count']}"
+        )
+    analyst_count_text = ", ".join(analyst_count_parts) or "no usable analyst observations"
+    analyst_policy_note = (
+        f"{analyst_target_policy['source']}; {analyst_count_text}; "
+        f"{analyst_target_policy['filtered_count']} implausible/outlier target(s) removed; "
+        f"reliability {analyst_target_policy['reliability']:.0%}; bounded model weight {analyst_target_weight:.0%}."
+    )
 
     html_content = f"""
     <!DOCTYPE html>
@@ -2525,7 +2964,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>{TICKER_SYMBOL} Compact Institutional Report v8.3</title>
+        <title>{TICKER_SYMBOL} Compact Institutional Report v9.0</title>
         <style>
             body {{ font-family: 'Segoe UI', Arial, sans-serif; background:#f4f7f6; color:#333; margin:0; padding:24px; }}
             .container {{ max-width:1080px; margin:auto; background:#fff; padding:34px; border-radius:8px; box-shadow:0 3px 14px rgba(0,0,0,.08); }}
@@ -2570,9 +3009,15 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         <table>
             <tr><th>Valuation Metric</th><th>Value</th><th>Recommended Buy-In Zone</th><th>Interpretation</th></tr>
             <tr>
+                <td class="metric-name">Evidence-Calibrated 12-Month Objective</td>
+                <td><strong>{fmt_money(research_price_objective)}</strong></td>
+                <td>{fmt_money(accumulation_zone)}</td>
+                <td>Robust blend of the independent sector model and bounded, outlier-filtered analyst evidence. Analyst influence is capped and shown below.</td>
+            </tr>
+            <tr>
                 <td class="metric-name">Independent Model Fair Value</td>
                 <td><strong>{fmt_money(intrinsic_value)}</strong></td>
-                <td>{fmt_money(accumulation_zone)}</td>
+                <td>Comparison only</td>
                 <td>Independent sector-specific DCF and peer-relative valuation; analyst price targets are excluded.</td>
             </tr>
             <tr>
@@ -2596,10 +3041,10 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             <tr>
                 <td class="metric-name">Quantitative Model Rating</td>
                 <td colspan="2"><span class="{rating_class}">{model_rating}</span></td>
-                <td>Based on the independent model fair value relative to the current price.</td>
+                <td>Based on the evidence-calibrated 12-month objective relative to the current price.</td>
             </tr>
         </table>
-        <div class="note"><strong>Architecture:</strong> {escape(valuation_archetype)}. Analyst price-target weight: 0%. FY1/FY2 operating-estimate weight: {operating_estimate_weight:.0%}. Model versus Street: {escape(street_comparison)}.</div>
+        <div class="note"><strong>Architecture:</strong> {escape(valuation_archetype)}. Analyst price-target weight: {analyst_target_weight:.0%}. FY1/FY2 operating-estimate weight: {operating_estimate_weight:.0%}. Independent model versus Street: {escape(street_comparison)}. Model confidence: {model_confidence}%.<br><br><strong>Analyst calibration:</strong> {escape(analyst_policy_note)}<br><br><strong>Unit policy:</strong> {escape(currency_unit_note)}</div>
 
         <h2>2. Latest Verified Wall Street Action Per Firm — {REPORT_YEAR} YTD</h2>
         <div class="summary-grid">
@@ -2647,7 +3092,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             <tr><td class="metric-name">PEG Ratio</td><td>{fmt_multiple(peg_ratio, 2)}</td><td>About 1.0x-2.0x</td><td>Less useful for highly cyclical or negative-earnings companies.</td></tr>
             <tr><td class="metric-name">Price-to-Sales</td><td>{fmt_multiple(ps_ratio, 2)}</td><td>Industry dependent</td><td>Important for high-growth firms when earnings are not yet normalized.</td></tr>
             <tr><td class="metric-name">EV / EBITDA</td><td>{fmt_multiple(ev_ebitda)}</td><td>Industry dependent</td><td>Useful for capital-intensive and cyclical businesses.</td></tr>
-            <tr><td class="metric-name">Debt-to-Equity</td><td>{fmt_multiple((debt_to_equity / 100) if debt_to_equity else 0, 2)}</td><td>Lower is safer</td><td>Measures financial leverage and balance-sheet risk.</td></tr>
+            <tr><td class="metric-name">Debt-to-Equity</td><td>{fmt_multiple((debt_to_equity / 100) if debt_to_equity is not None else None, 2)}</td><td>Lower is safer</td><td>Measures financial leverage and balance-sheet risk.</td></tr>
             <tr><td class="metric-name">Operating Margin</td><td>{fmt_pct(current_operating_margin)}</td><td>Higher is better</td><td>Measures current operating profitability.</td></tr>
         </table>
 
@@ -2659,7 +3104,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     output_dir = os.path.abspath(output_dir or os.getcwd())
     os.makedirs(output_dir, exist_ok=True)
-    html_path = os.path.join(output_dir, f"{TICKER_SYMBOL}_AI_Valuation_Report_v8_3.html")
+    html_path = os.path.join(output_dir, f"{TICKER_SYMBOL}_AI_Valuation_Report_v9_0.html")
     with open(html_path, "w", encoding="utf-8") as file:
         file.write(html_content)
 

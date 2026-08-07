@@ -45,6 +45,7 @@ You talk to it in normal English or Hindi. There are no slash commands to memori
 - [Android SMS and monthly-budget setup](#android-sms-and-monthly-budget-setup)
 - [Swiggy order-history setup](#swiggy-order-history-setup)
 - [Free cloud deployment](#free-cloud-deployment)
+- [Architecture and decision log](ARCHITECTURE_DECISIONS.md)
 - [Starting and stopping the agent](#starting-and-stopping-the-agent)
 - [Schedules](#schedules)
 - [Local PowerShell commands](#local-powershell-commands)
@@ -195,7 +196,11 @@ Gemini does **not** control budget amounts. SMS/receipt parsing, incoming-credit
 
 For stocks, Gemini Search is only one analyst-source adapter. Yahoo headline metadata and public RSS/JSON feeds now provide a separate crawler path. Relevant evidence is scored using publisher quality, an optional reviewed author reputation, company/ticker relevance, freshness, independent corroboration, and noise penalties; near-duplicate headlines do not receive extra votes. That evidence is combined with trend, moving averages, 3/6/12-month momentum, and RSI to produce a separate `STRONG SELL` / `SELL` / `HOLD` / `BUY` / `STRONG BUY` market-sentiment signal with confidence and coverage. Individual analyst actions must be dated in the current calendar year and include a public source URL; missing targets remain `N/A` rather than being guessed. The current rolling Yahoo consensus is labelled separately from those YTD action rows.
 
-Gemini quota failure therefore no longer removes all analyst discovery: public-feed target headlines can still be extracted conservatively. Core market data, valuation, technical analysis, HTML generation, and the deterministic sentiment fallback remain independent of Gemini. Thin or unavailable public evidence is shown as a low-confidence technical-only fallback, not as false precision.
+The stock report now keeps two numbers intentionally separate. The **Independent Fair Value** comes only from the valuation models. The **Evidence-Calibrated 12-Month Objective** starts with that independent value and may apply a strictly capped analyst-consensus influence. Current-year targets use one latest vote per firm, implausible targets and statistical outliers are removed, and wider disagreement reduces their weight. A rolling provider consensus is used only as a lower-confidence fallback. This prevents one stale target, a duplicated firm, or an analyst-data outage from controlling the result.
+
+Cross-listed shares and ADRs are normalized before valuation. For example, when a US-listed ADR trades in USD but its company files statements in TWD, the engine converts monetary statement values and revenue estimates using an explicit market FX rate and derives the quote-equivalent share count from market capitalization divided by the ADR price. If the required FX rate is unavailable, affected inputs are omitted and confidence is capped instead of mixing currencies silently.
+
+Gemini quota failure therefore no longer removes all analyst discovery: public-feed target headlines can still be extracted conservatively, and the engine makes at most one target-focused grounded request per ticker while trying the configured model fallbacks on retryable quota or availability failures. Core market data, valuation, technical analysis, HTML generation, and the deterministic sentiment fallback remain independent of Gemini. Thin or unavailable public evidence is shown as a low-confidence technical-only fallback, not as false precision.
 
 ---
 
@@ -487,6 +492,7 @@ Optional stock settings:
 
 ```dotenv
 FMP_API_KEY=
+STOCK_GEMINI_MODELS=
 STOCK_REPORT_TIMEOUT_MINUTES=180
 REPORT_PUBLIC_BASE_URL=
 MARKET_SENTIMENT_LOOKBACK_DAYS=120
@@ -498,6 +504,8 @@ MARKET_AUTHOR_REPUTATION_JSON={"exact analyst or handle":0.90}
 # Optional official X API bearer token. Leave blank to skip X completely.
 MARKET_X_BEARER_TOKEN=
 ```
+
+Leave `STOCK_GEMINI_MODELS` blank to use the tested fallback list. It controls only the optional grounded analyst-target search; Yahoo/public evidence and every valuation calculation continue without it.
 
 `MARKET_REDDIT_ENABLED=false` disables the low-weight public Reddit RSS adapter, and `MARKET_GDELT_ENABLED=false` disables GDELT. X is queried only through its official recent-search API when `MARKET_X_BEARER_TOKEN` is configured; there is no hidden Twitter/X login or page scraping. Social authors receive a meaningful boost only when the feed identifies the author and that exact author is present in your reviewed `MARKET_AUTHOR_REPUTATION_JSON`; otherwise social posts stay low weight. Publisher weights and every accepted headline's final weight are visible in the HTML report.
 
@@ -779,6 +787,8 @@ Follow the **[complete Oracle Cloud deployment guide](CLOUD_DEPLOYMENT.md)**. It
 If Oracle signup or capacity is unavailable, use the **[complete AWS Free Plan deployment guide](AWS_FREE_DEPLOYMENT.md)**. The same container runs on an EC2 `t4g.small` without application changes. AWS is easier to provision but is a temporary free option: the current T4g promotion ends on December 31, 2026, and a new AWS Free account plan ends after six months or when its credits are exhausted.
 
 After cloud cutover, stop the Windows copy. Running local and cloud listeners together can process the same message twice.
+
+For a ground-up explanation of every module, data flow, security boundary, package choice, deployment decision, alternative, and extension pattern, read the **[complete architecture and decision log](ARCHITECTURE_DECISIONS.md)**.
 
 ---
 

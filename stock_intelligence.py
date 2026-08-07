@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import statistics
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
@@ -220,8 +221,25 @@ def memory_storage_valuation_policy(ticker, company_text=""):
         },
         "DIVERSIFIED_MEMORY": {
             "subtype": subtype,
-            "label": "Diversified DRAM & NAND Memory",
+            "label": "Diversified DRAM, HBM & NAND Memory",
             "peer_symbols": ["SNDK", "285A.T", "000660.KS", "005930.KS"],
+            # HBM-led memory upcycles can change mix, margins and earnings power
+            # faster than a trailing mid-cycle average. Keep normalization in the
+            # model, but give period-matched FY1/FY2 evidence meaningful weight.
+            "weights": {
+                "DCF": 0.05,
+                "Forward P/E": 0.45,
+                "Normalized P/E": 0.30,
+                "EV/EBITDA": 0.20,
+            },
+            "growth_cap": 0.65,
+            "terminal_margin_floor": 0.12,
+            "terminal_margin_cap": 0.42,
+            "forward_ebit_margin_cap": 0.95,
+            "structural_forward_eps_weight": 0.72,
+            "structural_forward_pe_floor": 6.5,
+            "structural_normalized_pe_floor": 6.5,
+            "outlier_band": (0.50, 1.95),
         },
         "HDD": {
             "subtype": subtype,
@@ -244,6 +262,348 @@ def memory_storage_valuation_policy(ticker, company_text=""):
         "label": "General Memory & Storage",
         "peer_symbols": ["MU", "SNDK", "WDC", "STX"],
     }))
+
+
+def normalize_currency_code(value):
+    """Return a conservative three-letter currency code or an empty string."""
+    code = str(value or "").strip().upper()
+    return code if re.fullmatch(r"[A-Z]{3}", code) else ""
+
+
+def currency_pair_candidates(financial_currency, quote_currency):
+    """Return Yahoo FX symbols and whether each quote must be inverted.
+
+    Yahoo normally exposes `TWDUSD=X` as USD per TWD. Some pairs are available
+    only in the reverse direction, so callers try both forms and invert the
+    second. Keeping this mapping explicit prevents an ADR's TWD/EUR statements
+    from being combined directly with a USD share price.
+    """
+    source = normalize_currency_code(financial_currency)
+    destination = normalize_currency_code(quote_currency)
+    if not source or not destination or source == destination:
+        return []
+    return [
+        (f"{source}{destination}=X", False),
+        (f"{destination}{source}=X", True),
+    ]
+
+
+def convert_currency_amount(value, source_currency, quote_currency, rate=None):
+    """Convert one monetary value, failing closed when cross-currency FX is absent."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    source = normalize_currency_code(source_currency)
+    destination = normalize_currency_code(quote_currency)
+    if not source or not destination:
+        return None
+    if source == destination:
+        return number
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return None
+    return number * rate if math.isfinite(rate) and rate > 0 else None
+
+
+def quote_equivalent_share_count(market_cap, current_price, reported_shares=None):
+    """Use the share/ADR basis consistent with quote-currency market value."""
+    try:
+        market_cap = float(market_cap)
+        current_price = float(current_price)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) and value > 0 for value in (market_cap, current_price)):
+        return None
+    implied = market_cap / current_price
+    try:
+        reported = float(reported_shares)
+    except (TypeError, ValueError):
+        reported = None
+    if reported is not None and math.isfinite(reported) and reported > 0:
+        ratio = reported / implied
+        if 0.75 <= ratio <= 1.25:
+            return reported
+    return implied
+
+
+def apply_directional_scenario_shift(value, relative_shift, floor_scale=0.08):
+    """Move a metric monotonically for bear/bull cases, including negatives.
+
+    Multiplying a negative growth rate by `(1 - bear_shift)` accidentally makes
+    the contraction less severe. This helper moves a bear case downward and a
+    bull case upward regardless of the starting sign.
+    """
+    try:
+        value = float(value)
+        relative_shift = float(relative_shift)
+        floor_scale = abs(float(floor_scale))
+    except (TypeError, ValueError):
+        return value
+    if not math.isfinite(value) or not math.isfinite(relative_shift):
+        return value
+    magnitude = max(abs(value), floor_scale)
+    return value + relative_shift * magnitude
+
+
+def normalize_scenario_estimates(low, base, high):
+    """Keep provider bear/base/bull estimates ordered without inventing values."""
+    def finite(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    low_value, base_value, high_value = map(finite, (low, base, high))
+    if low_value is not None and high_value is not None and low_value > high_value:
+        low_value, high_value = high_value, low_value
+    if base_value is not None:
+        if low_value is not None:
+            low_value = min(low_value, base_value)
+        if high_value is not None:
+            high_value = max(high_value, base_value)
+    return low_value, base_value, high_value
+
+
+def complete_forward_revenue_path(year_one, year_two, trailing_revenue, growth):
+    """Complete a two-year revenue path without multiplying a missing value."""
+    def positive(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    first = positive(year_one) or positive(trailing_revenue)
+    second = positive(year_two)
+    if second is None and first is not None:
+        try:
+            growth_value = float(growth)
+        except (TypeError, ValueError):
+            growth_value = 0.0
+        if not math.isfinite(growth_value):
+            growth_value = 0.0
+        second = first * max(1.0 + growth_value, 0.01)
+    return first, second
+
+
+def filter_non_monotonic_scenario_methods(raw_by_scenario):
+    """Reject scenario methods whose bear/base/bull ordering is inverted.
+
+    Returning the rejected map separately makes the loss of a method visible to
+    diagnostics and confidence scoring instead of silently forcing its output to
+    the base value.
+    """
+    accepted = {
+        name: dict((raw_by_scenario or {}).get(name) or {})
+        for name in ("Bear", "Base", "Bull")
+    }
+    rejected = {name: {} for name in ("Bear", "Base", "Bull")}
+    base_values = accepted["Base"]
+    for method, base_value in list(base_values.items()):
+        try:
+            base_number = float(base_value)
+        except (TypeError, ValueError):
+            continue
+        bear_value = accepted["Bear"].get(method)
+        bull_value = accepted["Bull"].get(method)
+        try:
+            if bear_value is not None and float(bear_value) > base_number:
+                rejected["Bear"][method] = accepted["Bear"].pop(method)
+        except (TypeError, ValueError):
+            rejected["Bear"][method] = accepted["Bear"].pop(method)
+        try:
+            if bull_value is not None and float(bull_value) < base_number:
+                rejected["Bull"][method] = accepted["Bull"].pop(method)
+        except (TypeError, ValueError):
+            rejected["Bull"][method] = accepted["Bull"].pop(method)
+    return accepted, rejected
+
+
+def robust_analyst_target_policy(
+    current_price,
+    independent_value,
+    *,
+    verified_targets=None,
+    rolling_mean=None,
+    rolling_median=None,
+    rolling_low=None,
+    rolling_high=None,
+    opinion_count=0,
+    archetype="GENERAL_AI",
+):
+    """Build a bounded, auditable Street-calibrated 12-month objective.
+
+    Verified current-year targets use one latest vote per firm before entering
+    this function. The policy rejects implausible values, removes extreme
+    median-absolute-deviation outliers, favors the median over the mean, and
+    caps analyst influence. It never overwrites the independent valuation.
+    """
+    def positive(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    price = positive(current_price)
+    independent = positive(independent_value)
+    plausible_low = price * 0.20 if price else 0.0
+    plausible_high = price * 5.0 if price else float("inf")
+    raw_verified_values = [
+        number for number in (positive(value) for value in (verified_targets or []))
+        if number is not None
+    ]
+    verified_values = sorted(
+        number for number in raw_verified_values
+        if plausible_low <= number <= plausible_high
+    )
+    rolling_values = sorted(
+        number for number in (positive(rolling_mean), positive(rolling_median))
+        if number is not None and plausible_low <= number <= plausible_high
+    )
+    rolling_dispersion_values = sorted(
+        number
+        for number in (
+            *rolling_values,
+            positive(rolling_low),
+            positive(rolling_high),
+        )
+        if number is not None and plausible_low <= number <= plausible_high
+    )
+    try:
+        provider_opinion_count = max(int(opinion_count or 0), 0)
+    except (TypeError, ValueError):
+        provider_opinion_count = 0
+
+    source = "unavailable"
+    source_count = 0
+    filtered_count = len(raw_verified_values) - len(verified_values)
+    reliability_multiplier = 1.0
+    coverage_count = 0.0
+    anchor = None
+    values = []
+    dispersion_values = []
+
+    if len(verified_values) >= 3:
+        raw_count = len(verified_values)
+        center = statistics.median(verified_values)
+        deviations = [abs(value - center) for value in verified_values]
+        mad = statistics.median(deviations)
+        lower = max(plausible_low, center * 0.35)
+        upper = min(plausible_high, center * 2.50)
+        if mad > 0:
+            robust_sigma = 1.4826 * mad
+            lower = max(lower, center - 4.0 * robust_sigma)
+            upper = min(upper, center + 4.0 * robust_sigma)
+        values = [value for value in verified_values if lower <= value <= upper]
+        dispersion_values = list(values)
+        filtered_count += raw_count - len(values)
+        source = "verified current-year firm targets"
+        source_count = len(values)
+        coverage_count = len(values)
+    elif verified_values:
+        values = list(verified_values)
+        source_count = len(verified_values)
+        verified_anchor = (
+            0.70 * statistics.median(verified_values)
+            + 0.30 * statistics.fmean(verified_values)
+        )
+        if rolling_values:
+            rolling_anchor = (
+                0.70 * statistics.median(rolling_values)
+                + 0.30 * statistics.fmean(rolling_values)
+            )
+            verified_share = 0.50 if len(verified_values) == 1 else 0.60
+            anchor = verified_share * verified_anchor + (1.0 - verified_share) * rolling_anchor
+            dispersion_values = sorted(verified_values + rolling_dispersion_values)
+            source = "thin verified firm targets + rolling provider consensus"
+            coverage_count = len(verified_values) + min(provider_opinion_count, 12) * 0.25
+            reliability_multiplier = 0.70
+        else:
+            anchor = verified_anchor
+            dispersion_values = list(verified_values)
+            source = "thin verified current-year firm targets"
+            coverage_count = len(verified_values)
+            reliability_multiplier = 0.55
+    elif rolling_values:
+        values = list(rolling_values)
+        dispersion_values = rolling_dispersion_values or list(rolling_values)
+        source = "rolling provider consensus"
+        source_count = provider_opinion_count
+        coverage_count = min(provider_opinion_count, 12) * 0.50
+        reliability_multiplier = 0.55
+
+    if not values:
+        return {
+            "objective": independent or price,
+            "anchor": None,
+            "weight": 0.0,
+            "source": source,
+            "source_count": 0,
+            "verified_count": 0,
+            "provider_opinion_count": provider_opinion_count,
+            "filtered_count": filtered_count,
+            "dispersion": None,
+            "reliability": 0.0,
+        }
+
+    median_target = statistics.median(values)
+    mean_target = statistics.fmean(values)
+    if anchor is None:
+        anchor = 0.70 * median_target + 0.30 * mean_target
+
+    def percentile(sorted_values, fraction):
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        position = (len(sorted_values) - 1) * fraction
+        lower_index = int(math.floor(position))
+        upper_index = int(math.ceil(position))
+        if lower_index == upper_index:
+            return sorted_values[lower_index]
+        weight = position - lower_index
+        return sorted_values[lower_index] * (1 - weight) + sorted_values[upper_index] * weight
+
+    q1 = percentile(dispersion_values, 0.25)
+    q3 = percentile(dispersion_values, 0.75)
+    dispersion_denominator = anchor if anchor and anchor > 0 else median_target
+    dispersion = (q3 - q1) / dispersion_denominator if dispersion_denominator > 0 else 1.0
+    coverage = min(coverage_count / 12.0, 1.0)
+    agreement = max(0.25, min(1.0, 1.0 - dispersion))
+    reliability = max(0.0, min(1.0, 0.35 + 0.40 * coverage + 0.25 * agreement))
+    cap_by_archetype = {
+        "MEMORY_STORAGE": 0.40,
+        "WAFER_FOUNDRY": 0.38,
+        "SEMI_EQUIPMENT": 0.34,
+        "AI_COMPUTE": 0.34,
+    }
+    weight_cap = cap_by_archetype.get(str(archetype or "").upper(), 0.30)
+    reliability *= reliability_multiplier
+    weight = weight_cap * reliability if independent is not None else 1.0
+    objective = (
+        independent * (1.0 - weight) + anchor * weight
+        if independent is not None else anchor
+    )
+    return {
+        "objective": objective,
+        "anchor": anchor,
+        "weight": weight,
+        "source": source,
+        "source_count": source_count,
+        "verified_count": (
+            source_count
+            if source == "verified current-year firm targets"
+            else len(verified_values)
+        ),
+        "provider_opinion_count": provider_opinion_count,
+        "filtered_count": filtered_count,
+        "dispersion": dispersion,
+        "reliability": reliability,
+    }
 
 
 POSITIVE_PHRASES = {
@@ -955,23 +1315,24 @@ def aggregate_market_signal(scored_items, technical):
 
 _TARGET_PATTERNS = (
     re.compile(
-        r"price\s+target(?:\s+(?:on|for)\s+[A-Za-z0-9&.'() -]{1,70})?\s+"
+        r"(?:price\s+target|target\s+price)(?:\s+(?:on|for)\s+[A-Za-z0-9&.'() -]{1,70})?\s+"
         r"(?:raised|lifted|increased|boosted|adjusted|cut|lowered|reduced)?\s*"
         r"to\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+from\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)",
         re.I,
     ),
     re.compile(
-        r"price\s+target(?:\s+(?:on|for)\s+[A-Za-z0-9&.'() -]{1,70})?\s+"
+        r"(?:price\s+target|target\s+price)(?:\s+(?:on|for)\s+[A-Za-z0-9&.'() -]{1,70})?\s+"
         r"(?:is\s+)?(?:raised|lifted|increased|boosted|adjusted|cut|lowered|reduced)?\s*"
         r"(?:from\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+)?(?:to|at|of)\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)",
         re.I,
     ),
     re.compile(
-        r"\b(?:PT|price\s+target)\s+(?:raised|lowered|adjusted)?\s*to\s+"
+        r"\b(?:PT|price\s+target|target\s+price)\s+(?:raised|lowered|adjusted)?\s*to\s+"
         r"\$?([0-9][0-9,]*(?:\.[0-9]+)?)",
         re.I,
     ),
     re.compile(r"\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+price\s+target", re.I),
+    re.compile(r"\$([0-9][0-9,]*(?:\.[0-9]+)?)\s+target\b", re.I),
 )
 
 
@@ -1113,13 +1474,25 @@ def extract_current_year_analyst_targets(items, ticker, company_name, current_pr
         if not published or published.year != now.year or published > now or not url:
             continue
         relevance = relevance_score(item, ticker, company_name, infer_ai_theme(ticker, company_name))
-        if relevance < 0.50:
+        if relevance < 0.42:
             continue
         text = f"{item.get('title', '')} {item.get('summary', '')}".strip()
         lower = text.lower()
-        if "price target" not in lower or not any(term in lower for term in (
+        target_language = bool(re.search(
+            r"\b(?:price\s+target|target\s+price|pt)\b|\$[0-9][0-9,.]*\s+target\b",
+            text,
+            re.I,
+        ))
+        # This report is for the USD-listed instrument. Never reinterpret an
+        # explicitly local-currency target (for example NT$ on 2330.TW) as USD.
+        explicit_non_usd_currency = bool(re.search(
+            r"(?:NT\$|\bTWD\b|\bNTD\b|€|\bEUR\b|¥|\bJPY\b|₩|\bKRW\b|£|\bGBP\b|C\$|\bCAD\b|A\$|\bAUD\b)",
+            text,
+            re.I,
+        ))
+        if not target_language or explicit_non_usd_currency or not any(term in lower for term in (
             "analyst", "raises", "raised", "cuts", "cut", "lowers", "boosts",
-            "initiates", "upgrades", "downgrades", "maintains", "reiterates", " at ", " by ",
+            "initiates", "upgrades", "downgrades", "maintains", "reiterates", "adjusts", " at ", " by ",
         )):
             continue
         previous = None

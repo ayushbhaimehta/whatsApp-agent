@@ -7,18 +7,26 @@ import pandas as pd
 
 from stock_intelligence import (
     aggregate_market_signal,
+    apply_directional_scenario_shift,
     author_reputation,
     build_market_intelligence,
+    complete_forward_revenue_path,
     collect_public_items,
+    convert_currency_amount,
+    currency_pair_candidates,
     current_calendar_year,
     extract_current_year_analyst_targets,
+    filter_non_monotonic_scenario_methods,
     infer_ai_theme,
     lexical_sentiment,
     memory_storage_valuation_policy,
     noise_penalty,
+    normalize_scenario_estimates,
     normalize_yahoo_analyst_history,
     parse_public_feed,
+    quote_equivalent_share_count,
     relevance_score,
+    robust_analyst_target_policy,
     score_market_items,
     signal_label,
     source_reputation,
@@ -233,6 +241,40 @@ class StockIntelligenceTests(unittest.TestCase):
         )], "BE", "Bloom Energy", 70, as_of=NOW)
         self.assertEqual(rows, [])
 
+    def test_target_extraction_accepts_pt_and_target_price_but_rejects_local_currency(self):
+        rows = extract_current_year_analyst_targets([
+            item(
+                "Mizuho Raises Micron (NASDAQ: MU) PT to $1,750 and Maintains Outperform",
+                source="Yahoo Finance", url="https://finance.yahoo.com/mu-mizuho",
+            ),
+            item(
+                "Needham Raises Taiwan Semiconductor (TSM) Target Price to $530 From $480",
+                source="Yahoo Finance", url="https://finance.yahoo.com/tsm-needham",
+            ),
+            item(
+                "Local Broker Raises TSM Target Price to NT$1,800",
+                source="Example", url="https://example.com/tsm-local",
+            ),
+        ], "TSM", "Taiwan Semiconductor Manufacturing", 419, as_of=NOW)
+        # The MU headline is irrelevant to TSM; the explicit NT$ local-share target
+        # is rejected rather than being mislabeled as a USD ADR target.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["firm"], "Needham")
+        self.assertEqual(rows[0]["price_target"], 530.0)
+        self.assertEqual(rows[0]["previous_price_target"], 480.0)
+
+        mu_rows = extract_current_year_analyst_targets([
+            item(
+                "Mizuho Raises Micron (NASDAQ: MU) PT to $1,750 and Maintains Outperform",
+                source="Yahoo Finance", url="https://finance.yahoo.com/mu-mizuho",
+            ),
+            item(
+                "BofA Maintains Buy and $1,500 Target on Micron Technology",
+                source="Yahoo Finance", url="https://finance.yahoo.com/mu-bofa",
+            ),
+        ], "MU", "Micron Technology", 875, as_of=NOW)
+        self.assertEqual({row["price_target"] for row in mu_rows}, {1500.0, 1750.0})
+
     def test_sandisk_target_headline_variants_are_extracted_without_gemini(self):
         rows = extract_current_year_analyst_targets([
             item(
@@ -290,6 +332,137 @@ class StockIntelligenceTests(unittest.TestCase):
         self.assertGreaterEqual(policy["structural_forward_eps_weight"], 0.70)
         self.assertGreaterEqual(policy["structural_forward_pe_floor"], 6.0)
         self.assertIn("Forward P/E", policy["weights"])
+
+    def test_mu_diversified_memory_policy_models_hbm_cycle_explicitly(self):
+        policy = memory_storage_valuation_policy(
+            "MU", "Micron produces DRAM, HBM and NAND memory",
+        )
+        self.assertEqual(policy["subtype"], "DIVERSIFIED_MEMORY")
+        self.assertIn("HBM", policy["label"])
+        self.assertIn("Forward P/E", policy["weights"])
+        self.assertIn("Normalized P/E", policy["weights"])
+        self.assertGreaterEqual(policy["growth_cap"], 0.50)
+        self.assertGreaterEqual(policy["forward_ebit_margin_cap"], 0.80)
+        self.assertGreaterEqual(policy["structural_forward_eps_weight"], 0.65)
+
+    def test_currency_pair_policy_normalizes_adrs_and_preserves_same_currency(self):
+        self.assertEqual(currency_pair_candidates("USD", "USD"), [])
+        self.assertEqual(
+            currency_pair_candidates("TWD", "USD"),
+            [("TWDUSD=X", False), ("USDTWD=X", True)],
+        )
+        self.assertEqual(currency_pair_candidates("not-a-currency", "USD"), [])
+        self.assertEqual(convert_currency_amount(100, "USD", "USD"), 100.0)
+        self.assertAlmostEqual(
+            convert_currency_amount(1000, "TWD", "USD", 0.031), 31.0,
+        )
+        self.assertIsNone(convert_currency_amount(1000, "TWD", "USD", None))
+
+    def test_quote_share_basis_uses_adr_equivalent_market_cap_over_price(self):
+        market_cap = 2_172_000_000_000
+        price = 419
+        implied = market_cap / price
+        self.assertAlmostEqual(
+            quote_equivalent_share_count(market_cap, price, implied), implied,
+        )
+        # A five-times underlying-share count must not replace the ADR basis.
+        self.assertAlmostEqual(
+            quote_equivalent_share_count(market_cap, price, implied * 5), implied,
+        )
+
+    def test_directional_scenario_shift_is_monotonic_even_in_contraction(self):
+        base_growth = -0.12
+        bear = apply_directional_scenario_shift(base_growth, -0.22)
+        bull = apply_directional_scenario_shift(base_growth, 0.18)
+        self.assertLess(bear, base_growth)
+        self.assertGreater(bull, base_growth)
+        self.assertLess(
+            apply_directional_scenario_shift(0.30, -0.22),
+            0.30,
+        )
+
+    def test_provider_scenario_ranges_and_method_outputs_cannot_invert(self):
+        self.assertEqual(
+            normalize_scenario_estimates(130, 120, 110),
+            (110.0, 120.0, 130.0),
+        )
+        self.assertEqual(
+            normalize_scenario_estimates(125, 120, 140),
+            (120.0, 120.0, 140.0),
+        )
+        accepted, rejected = filter_non_monotonic_scenario_methods({
+            "Bear": {"DCF": 130, "Forward P/E": 90},
+            "Base": {"DCF": 120, "Forward P/E": 100},
+            "Bull": {"DCF": 150, "Forward P/E": 95},
+        })
+        self.assertNotIn("DCF", accepted["Bear"])
+        self.assertEqual(rejected["Bear"]["DCF"], 130)
+        self.assertNotIn("Forward P/E", accepted["Bull"])
+        self.assertEqual(rejected["Bull"]["Forward P/E"], 95)
+
+    def test_missing_fx_revenue_path_fails_closed_without_crashing(self):
+        self.assertEqual(
+            complete_forward_revenue_path(None, None, None, 0.15),
+            (None, None),
+        )
+        first, second = complete_forward_revenue_path(None, None, 100, 0.15)
+        self.assertEqual(first, 100.0)
+        self.assertAlmostEqual(second, 115.0)
+
+    def test_robust_analyst_policy_filters_outlier_and_caps_street_weight(self):
+        policy = robust_analyst_target_policy(
+            100,
+            120,
+            verified_targets=[130, 132, 135, 138, 140, 500],
+            rolling_mean=150,
+            rolling_median=145,
+            opinion_count=30,
+            archetype="MEMORY_STORAGE",
+        )
+        self.assertEqual(policy["source"], "verified current-year firm targets")
+        self.assertEqual(policy["filtered_count"], 1)
+        self.assertLess(policy["anchor"], 150)
+        self.assertGreater(policy["objective"], 120)
+        self.assertLessEqual(policy["weight"], 0.40)
+
+    def test_rolling_consensus_receives_less_weight_than_verified_firm_targets(self):
+        verified = robust_analyst_target_policy(
+            100, 110, verified_targets=[125, 130, 135, 140],
+            opinion_count=20, archetype="WAFER_FOUNDRY",
+        )
+        rolling = robust_analyst_target_policy(
+            100, 110, verified_targets=[], rolling_mean=133,
+            rolling_median=132, opinion_count=20, archetype="WAFER_FOUNDRY",
+        )
+        self.assertGreater(verified["weight"], rolling["weight"])
+
+    def test_thin_verified_targets_are_combined_transparently_not_discarded(self):
+        policy = robust_analyst_target_policy(
+            100, 110, verified_targets=[125, 130], rolling_mean=135,
+            rolling_median=134, rolling_low=90, rolling_high=180,
+            opinion_count=20, archetype="WAFER_FOUNDRY",
+        )
+        self.assertEqual(
+            policy["source"],
+            "thin verified firm targets + rolling provider consensus",
+        )
+        self.assertEqual(policy["verified_count"], 2)
+        self.assertEqual(policy["provider_opinion_count"], 20)
+        self.assertLess(policy["anchor"], 134)
+
+    def test_wide_rolling_target_range_reduces_reliability(self):
+        tight = robust_analyst_target_policy(
+            100, 110, rolling_mean=130, rolling_median=129,
+            rolling_low=120, rolling_high=140, opinion_count=20,
+            archetype="MEMORY_STORAGE",
+        )
+        wide = robust_analyst_target_policy(
+            100, 110, rolling_mean=130, rolling_median=129,
+            rolling_low=40, rolling_high=400, opinion_count=20,
+            archetype="MEMORY_STORAGE",
+        )
+        self.assertLess(wide["reliability"], tight["reliability"])
+        self.assertLess(wide["weight"], tight["weight"])
 
     def test_all_analyst_providers_share_ytd_source_firm_and_plausibility_boundary(self):
         base = {

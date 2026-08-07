@@ -24,6 +24,7 @@ const {
     buildBudgetEnrichmentPrompt,
     applySmsMerchantClassification,
     applyBudgetEnrichment,
+    isPotentialPaymentText,
     attachSwiggyOrdersToTransactions,
     summarizeBudget,
     formatBudgetWhatsApp,
@@ -69,6 +70,17 @@ test('does not count incoming credits as spending', () => {
         text: 'ICICIB Acct XX027 is credited with Rs 50,000.00 on 11-Jul-26 from GEETA MEHTA.',
         sourceType: 'sms'
     }), null);
+});
+
+test('keeps report admission aligned with settled SMS evidence accepted at ingestion', () => {
+    assert.equal(isPotentialPaymentText('INR 500 transferred to Cafe Mysore'), true);
+    assert.equal(isPotentialPaymentText('Rs. 750 withdrawn from your account'), true);
+    assert.equal(isPotentialPaymentText('A purchase of INR 249 was completed'), true);
+    assert.equal(isPotentialPaymentText('INR 199 purchased at Corner Store'), true);
+    assert.equal(isPotentialPaymentText('INR 300 reversal credited back'), true);
+    assert.equal(isPotentialPaymentText('INR 425 sent from your account to Rahul'), true);
+    assert.equal(isPotentialPaymentText('Please send INR 425 to Rahul'), false);
+    assert.equal(isPotentialPaymentText('Your available balance is INR 5,000'), false);
 });
 
 test('redacts payment identifiers before receipt text can reach Gemini', () => {
@@ -718,7 +730,7 @@ test('reads encrypted Android financial SMS records for the selected month', () 
         id: 'record-1',
         occurredAt: '2026-07-14T10:00:00.000Z',
         sender: 'HDFCBK',
-        body: 'INR 450 debited for Blinkit order'
+        body: 'INR 450 transferred to Blinkit'
     };
     fs.writeFileSync(storePath, `${JSON.stringify(encryptStoredSmsRecord(record, secret))}\n`, 'utf8');
     try {

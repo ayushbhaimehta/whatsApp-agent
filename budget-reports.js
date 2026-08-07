@@ -935,7 +935,12 @@ function isPotentialPaymentText(text) {
     const source = String(text || '');
     if (!extractAmountPaise(source)) return false;
     if (inferDirection(source) === 'income') return false;
-    return /\b(?:paid|payment|debited|spent|charged|purchase|order|refund(?:ed)?|credited\s+back|swiggy|instamart|zepto|blinkit|zomato|ownly|big\s*basket)\b/i.test(source);
+    // Keep report admission aligned with the settled-event vocabulary already
+    // accepted by both transaction-only SMS privacy gates. Without this, a
+    // safely accepted alert can reach encrypted storage and then disappear
+    // solely because it says "transferred", "withdrawn", or "purchased".
+    return /\b(?:paid|payment|debited|spent|charged|purchase(?:d)?|order|refund(?:ed)?|reversal|withdrawn|transferred|credited\s+back|swiggy|instamart|zepto|blinkit|zomato|ownly|big\s*basket)\b/i.test(source) ||
+        /\bsent\b[\s\S]{0,160}\bfrom\b[\s\S]{0,160}\bto\b/i.test(source);
 }
 
 function createTransaction({ provider, externalId, occurredAt, text, sourceType }) {
