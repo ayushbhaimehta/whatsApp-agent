@@ -200,6 +200,10 @@ The stock report now keeps two numbers intentionally separate. The **Independent
 
 Cross-listed shares and ADRs are normalized before valuation. For example, when a US-listed ADR trades in USD but its company files statements in TWD, the engine converts monetary statement values and revenue estimates using an explicit market FX rate and derives the quote-equivalent share count from market capitalization divided by the ADR price. If the required FX rate is unavailable, affected inputs are omitted and confidence is capped instead of mixing currencies silently.
 
+The v9.1 stock engine also aligns FY0 and FY+1 estimates to the actual date twelve months from the report. This matters because MU's August fiscal year-end and TSM's December fiscal year-end require very different interpolation weights. Annual EPS is checked against period-matched current/next-quarter EPS and revenue: a quarter-corroborated HBM margin regime is allowed, while a malformed annual margin is transparently shrunk to the evidence envelope. Revenue and EPS analyst coverage are weighted separately, dual-listed peers receive one issuer vote, and disagreement among DCF/P-E/enterprise-value methods reduces weight and confidence without changing the raw displayed method values.
+
+Primary economics and secondary AI exposure are separate. The primary valuation families include leading/mature foundries; diversified DRAM/HBM/NAND and NAND flash; wafer-fab equipment; process control; OSAT packaging; packaging equipment; automated test equipment; probe/test interfaces; burn-in testing; photonics; networking; critical power/cooling; distributed on-site power; electrical/grid equipment; power construction; merchant generation; and regulated utilities. TSM therefore remains a foundry while still showing advanced packaging as a secondary CoWoS/SoIC exposure. AMKR/ASE remain OSATs, TER/COHU remain test-equipment companies, FORM remains a test-interface company, Bloom remains distributed power, and VRT/ETN/GEV/PWR no longer share one incompatible peer basket.
+
 Gemini quota failure therefore no longer removes all analyst discovery: public-feed target headlines can still be extracted conservatively, and the engine makes at most one target-focused grounded request per ticker while trying the configured model fallbacks on retryable quota or availability failures. Core market data, valuation, technical analysis, HTML generation, and the deterministic sentiment fallback remain independent of Gemini. Thin or unavailable public evidence is shown as a low-confidence technical-only fallback, not as false precision.
 
 ---
@@ -482,7 +486,7 @@ Test one ticker locally:
 npm run report -- AMD
 ```
 
-The report is written under `reports\`. If Python auto-detection fails, add an explicit path to `.env`:
+The report is written under `reports\`. A newly generated report from this revision ends in `_v9_1.html`; a `_v8_3.html` or `_v9_0.html` file is an older calculation and means the running machine/container has not been rebuilt from the latest code. If Python auto-detection fails, add an explicit path to `.env`:
 
 ```dotenv
 PYTHON_EXECUTABLE=C:\Users\your-name\AppData\Local\Programs\Python\Python312\python.exe

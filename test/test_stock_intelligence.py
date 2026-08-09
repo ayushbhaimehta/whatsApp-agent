@@ -10,14 +10,19 @@ from stock_intelligence import (
     apply_directional_scenario_shift,
     author_reputation,
     build_market_intelligence,
+    calendarize_fiscal_estimate,
     complete_forward_revenue_path,
     collect_public_items,
     convert_currency_amount,
     currency_pair_candidates,
     current_calendar_year,
+    data_center_power_valuation_policy,
+    dedupe_peer_symbols,
     extract_current_year_analyst_targets,
     filter_non_monotonic_scenario_methods,
     infer_ai_theme,
+    infer_secondary_ai_exposures,
+    infer_valuation_archetype,
     lexical_sentiment,
     memory_storage_valuation_policy,
     noise_penalty,
@@ -25,8 +30,10 @@ from stock_intelligence import (
     normalize_yahoo_analyst_history,
     parse_public_feed,
     quote_equivalent_share_count,
+    reconcile_forward_eps_estimate,
     relevance_score,
     robust_analyst_target_policy,
+    robust_method_composite,
     score_market_items,
     signal_label,
     source_reputation,
@@ -551,6 +558,137 @@ class StockIntelligenceTests(unittest.TestCase):
         self.assertEqual(result["signal"]["evidence_count"], 1)
         self.assertIn(result["signal"]["label"], {"BUY", "STRONG BUY"})
         self.assertEqual(len(fake.urls), 2)  # Google RSS fixtures; no live sockets.
+
+    def test_primary_business_taxonomy_covers_packaging_test_and_process_control(self):
+        self.assertEqual(
+            infer_valuation_archetype(
+                "AMKR",
+                "outsourced semiconductor assembly and test for NAND and HBM devices",
+            ),
+            "PACKAGING_OSAT",
+        )
+        self.assertEqual(
+            infer_valuation_archetype(
+                "UNKNOWN",
+                "outsourced semiconductor assembly and test services including memory testing",
+            ),
+            "PACKAGING_OSAT",
+        )
+        self.assertEqual(infer_valuation_archetype("ASX"), "PACKAGING_OSAT")
+        self.assertEqual(infer_valuation_archetype("KLIC"), "PACKAGING_EQUIPMENT")
+        self.assertEqual(
+            infer_valuation_archetype("TER", "DRAM and HBM automated test equipment"),
+            "SEMICONDUCTOR_TEST",
+        )
+        self.assertEqual(infer_valuation_archetype("FORM"), "TEST_INTERFACE")
+        self.assertEqual(infer_valuation_archetype("COHU"), "SEMICONDUCTOR_TEST")
+        self.assertEqual(infer_valuation_archetype("AEHR"), "BURN_IN_TEST")
+        self.assertEqual(infer_valuation_archetype("KLAC"), "SEMI_PROCESS_CONTROL")
+
+    def test_foundry_with_secondary_packaging_remains_a_foundry(self):
+        description = (
+            "pure-play wafer foundry providing leading process nodes, wafer fabrication, "
+            "and advanced packaging including CoWoS"
+        )
+        self.assertEqual(
+            infer_valuation_archetype("UNKNOWN", description),
+            "WAFER_FOUNDRY",
+        )
+        self.assertIn(
+            "ADVANCED_PACKAGING",
+            infer_secondary_ai_exposures("TSM", description),
+        )
+
+    def test_data_center_power_subtypes_use_economically_distinct_policies(self):
+        policies = {
+            ticker: data_center_power_valuation_policy(ticker)
+            for ticker in ("BE", "VRT", "ETN", "GEV", "PWR")
+        }
+        self.assertEqual(policies["BE"]["subtype"], "DISTRIBUTED_POWER")
+        self.assertEqual(policies["VRT"]["subtype"], "CRITICAL_POWER_COOLING")
+        self.assertEqual(policies["ETN"]["subtype"], "ELECTRICAL_EQUIPMENT")
+        self.assertEqual(policies["GEV"]["subtype"], "ELECTRICAL_EQUIPMENT")
+        self.assertEqual(policies["PWR"]["subtype"], "POWER_CONSTRUCTION")
+        self.assertIn("EV/Sales", policies["BE"]["weights"])
+        self.assertNotEqual(policies["BE"]["peer_symbols"], policies["PWR"]["peer_symbols"])
+        for policy in policies.values():
+            self.assertAlmostEqual(sum(policy["weights"].values()), 1.0)
+
+    def test_regulated_utilities_are_not_mixed_with_merchant_generators(self):
+        self.assertEqual(infer_valuation_archetype("NEE"), "REGULATED_UTILITY")
+        self.assertEqual(infer_valuation_archetype("CEG"), "POWER_GENERATION")
+
+    def test_fiscal_calendarization_differs_for_mu_and_tsm_year_ends(self):
+        as_of = datetime(2026, 8, 9, tzinfo=timezone.utc)
+        mu = calendarize_fiscal_estimate(
+            100, 200, datetime(2026, 8, 28, tzinfo=timezone.utc), as_of=as_of,
+        )
+        tsm = calendarize_fiscal_estimate(
+            100, 200, datetime(2026, 12, 31, tzinfo=timezone.utc), as_of=as_of,
+        )
+        self.assertAlmostEqual(mu["next_fy_weight"], 0.947, places=2)
+        self.assertAlmostEqual(tsm["next_fy_weight"], 0.605, places=2)
+        self.assertGreater(mu["value"], tsm["value"])
+
+    def test_quarterly_evidence_allows_hbm_margin_but_shrinks_malformed_eps(self):
+        corroborated = reconcile_forward_eps_estimate(
+            140,
+            200_000_000_000,
+            1_000_000_000,
+            quarterly_pairs=[(35, 50_000_000_000), (34, 49_000_000_000)],
+            current_net_margin=0.66,
+        )
+        self.assertEqual(corroborated["status"], "quarter-corroborated")
+        self.assertEqual(corroborated["value"], 140)
+
+        malformed = reconcile_forward_eps_estimate(
+            190,
+            200_000_000_000,
+            1_000_000_000,
+            quarterly_pairs=[(35, 50_000_000_000), (34, 49_000_000_000)],
+            current_net_margin=0.66,
+        )
+        self.assertEqual(malformed["status"], "shrunk-to-evidence-envelope")
+        self.assertLess(malformed["value"], 190)
+        self.assertLessEqual(malformed["margin_cap"], 0.90)
+
+    def test_dual_listed_peers_receive_one_issuer_vote(self):
+        self.assertEqual(
+            dedupe_peer_symbols("AMKR", ["ASX", "3711.TW", "6239.TW"]),
+            ["ASX", "6239.TW"],
+        )
+        self.assertEqual(
+            dedupe_peer_symbols("ASX", ["AMKR", "3711.TW", "6239.TW"]),
+            ["AMKR", "6239.TW"],
+        )
+
+    def test_robust_composite_never_mutates_raw_dcf(self):
+        result = robust_method_composite(
+            {"DCF": 100, "Forward P/E": 300, "EV/EBITDA": 310},
+            {"DCF": 0.30, "Forward P/E": 0.40, "EV/EBITDA": 0.30},
+            (0.50, 2.00),
+        )
+        self.assertEqual(result["used_values"]["DCF"], 100)
+        self.assertEqual(result["used_values"]["Forward P/E"], 300)
+        self.assertGreaterEqual(result["family_count"], 2)
+
+    def test_form_plain_word_is_not_treated_as_a_ticker_mention(self):
+        unrelated = item(
+            "Company files a new tax form after earnings",
+            summary="The form is available online.",
+        )
+        qualified = item(
+            "$FORM raises semiconductor probe-card guidance",
+            summary="FormFactor demand improves.",
+        )
+        self.assertLess(
+            relevance_score(unrelated, "FORM", "FormFactor", "SEMICONDUCTOR_TEST"),
+            0.42,
+        )
+        self.assertGreater(
+            relevance_score(qualified, "FORM", "FormFactor", "SEMICONDUCTOR_TEST"),
+            0.70,
+        )
 
 
 if __name__ == "__main__":

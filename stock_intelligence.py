@@ -18,7 +18,7 @@ import re
 import statistics
 import xml.etree.ElementTree as ET
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from urllib.parse import quote_plus, urlparse
@@ -97,16 +97,33 @@ AI_THEME_KEYWORDS = {
         "inference chip", "integrated circuit design",
     ),
     "WAFER_FOUNDRY": (
-        "foundry", "wafer fabrication", "wafer fab", "fabless", "process node",
-        "advanced packaging", "chip manufacturing", "semiconductor fabrication",
+        "pure-play foundry", "wafer foundry", "wafer fabrication", "wafer fab",
+        "process node", "chip manufacturing", "semiconductor fabrication",
     ),
     "SEMI_EQUIPMENT": (
-        "lithography", "wafer equipment", "process control", "etch", "deposition",
-        "metrology", "semiconductor equipment",
+        "lithography", "wafer equipment", "etch", "deposition",
+        "semiconductor capital equipment", "wafer processing equipment",
+    ),
+    "SEMI_PROCESS_CONTROL": (
+        "process control", "wafer inspection", "defect inspection", "metrology",
+        "yield management", "optical inspection", "inspection equipment",
+    ),
+    "SEMICONDUCTOR_TEST": (
+        "semiconductor test", "automated test equipment", "probe card", "wafer probe",
+        "system level test", "burn-in test", "test handler", "test and measurement",
+    ),
+    "ADVANCED_PACKAGING": (
+        "advanced packaging", "outsourced semiconductor assembly", "outsourced assembly",
+        "semiconductor packaging and test", "chip packaging", "wafer-level packaging",
+        "heterogeneous integration", "system-in-package", "flip chip packaging",
     ),
     "PHOTONICS_OPTICS": (
         "photonics", "silicon photonics", "optical transceiver", "co-packaged optics",
         "laser diode", "datacom optics", "optical networking",
+    ),
+    "NETWORKING_OPTICS": (
+        "ethernet switching", "network switch", "data center networking",
+        "networking silicon", "high-speed interconnect",
     ),
     "MEMORY_STORAGE": (
         "dram", "hbm", "nand", "memory chip", "data storage", "hard disk",
@@ -119,12 +136,40 @@ AI_THEME_KEYWORDS = {
         "power generation", "nuclear power", "natural gas generation", "grid capacity",
         "electricity demand", "independent power producer",
     ),
+    "REGULATED_UTILITY": (
+        "regulated electric utility", "rate base", "regulated utility",
+        "electric transmission utility", "public utility",
+    ),
     "AI_CLOUD_INFRA": (
         "gpu cloud", "ai cloud", "compute hosting", "ai infrastructure provider",
     ),
     "AI_SOFTWARE": (
         "ai software", "data platform", "machine learning platform", "application software",
     ),
+    "DATA_CENTER_REIT": (
+        "data center reit", "data center real estate", "colocation data center",
+    ),
+}
+
+# Tie-breaking is explicit so a description mentioning both a customer's AI
+# workload and the supplier's actual business model is classified by the latter.
+AI_THEME_PRIORITY = {
+    "ADVANCED_PACKAGING": 100,
+    "SEMICONDUCTOR_TEST": 95,
+    "SEMI_PROCESS_CONTROL": 90,
+    "WAFER_FOUNDRY": 85,
+    "SEMI_EQUIPMENT": 80,
+    "MEMORY_STORAGE": 75,
+    "PHOTONICS_OPTICS": 70,
+    "NETWORKING_OPTICS": 68,
+    "AI_COMPUTE": 65,
+    "DATA_CENTER_POWER": 60,
+    "POWER_GENERATION": 55,
+    "REGULATED_UTILITY": 54,
+    "HYPERSCALER": 50,
+    "AI_CLOUD_INFRA": 45,
+    "AI_SOFTWARE": 40,
+    "DATA_CENTER_REIT": 35,
 }
 
 
@@ -140,22 +185,121 @@ TICKER_THEME_OVERRIDES = {
     "UMC": "WAFER_FOUNDRY", "SMIC": "WAFER_FOUNDRY",
     # Wafer-fab equipment and process control
     "ASML": "SEMI_EQUIPMENT", "AMAT": "SEMI_EQUIPMENT", "LRCX": "SEMI_EQUIPMENT",
-    "KLAC": "SEMI_EQUIPMENT", "ONTO": "SEMI_EQUIPMENT", "CAMT": "SEMI_EQUIPMENT",
     "ACMR": "SEMI_EQUIPMENT", "MKSI": "SEMI_EQUIPMENT", "UCTT": "SEMI_EQUIPMENT",
+    "ACLS": "SEMI_EQUIPMENT",
+    # Inspection, metrology and yield/process control
+    "KLAC": "SEMI_PROCESS_CONTROL", "ONTO": "SEMI_PROCESS_CONTROL",
+    "CAMT": "SEMI_PROCESS_CONTROL", "NVMI": "SEMI_PROCESS_CONTROL",
+    # Semiconductor automated test, probe cards and burn-in
+    "TER": "SEMICONDUCTOR_TEST", "FORM": "SEMICONDUCTOR_TEST",
+    "COHU": "SEMICONDUCTOR_TEST", "AEHR": "SEMICONDUCTOR_TEST",
+    "ATEYY": "SEMICONDUCTOR_TEST", "6857.T": "SEMICONDUCTOR_TEST",
+    "TPRO.MI": "SEMICONDUCTOR_TEST",
+    # Outsourced assembly/test and advanced-packaging equipment
+    "AMKR": "ADVANCED_PACKAGING", "ASX": "ADVANCED_PACKAGING",
+    "KLIC": "ADVANCED_PACKAGING", "BESI.AS": "ADVANCED_PACKAGING",
+    "0522.HK": "ADVANCED_PACKAGING", "3711.TW": "ADVANCED_PACKAGING",
+    "6239.TW": "ADVANCED_PACKAGING",
     # Photonics / optical interconnect
     "COHR": "PHOTONICS_OPTICS", "LITE": "PHOTONICS_OPTICS", "AAOI": "PHOTONICS_OPTICS",
     "FN": "PHOTONICS_OPTICS", "IPGP": "PHOTONICS_OPTICS", "CIEN": "PHOTONICS_OPTICS",
     # Memory / storage
     "MU": "MEMORY_STORAGE", "WDC": "MEMORY_STORAGE", "STX": "MEMORY_STORAGE",
     "SNDK": "MEMORY_STORAGE", "SIMO": "MEMORY_STORAGE", "RMBS": "MEMORY_STORAGE",
+    "285A.T": "MEMORY_STORAGE", "000660.KS": "MEMORY_STORAGE",
+    "005930.KS": "MEMORY_STORAGE",
     # Data-center electrical, thermal and distributed generation (including Bloom)
     "BE": "DATA_CENTER_POWER", "VRT": "DATA_CENTER_POWER", "ETN": "DATA_CENTER_POWER",
     "GEV": "DATA_CENTER_POWER", "PWR": "DATA_CENTER_POWER", "CARR": "DATA_CENTER_POWER",
+    "NVT": "DATA_CENTER_POWER", "HUBB": "DATA_CENTER_POWER", "EME": "DATA_CENTER_POWER",
     # Generators / grid beneficiaries
     "CEG": "POWER_GENERATION", "VST": "POWER_GENERATION", "NRG": "POWER_GENERATION",
+    "TLN": "POWER_GENERATION",
+    "NEE": "REGULATED_UTILITY", "AEP": "REGULATED_UTILITY",
+    "DUK": "REGULATED_UTILITY", "SO": "REGULATED_UTILITY", "D": "REGULATED_UTILITY",
+    # Networking and switching
+    "ANET": "NETWORKING_OPTICS", "ALAB": "NETWORKING_OPTICS",
     # GPU cloud / AI infrastructure
     "CRWV": "AI_CLOUD_INFRA", "NBIS": "AI_CLOUD_INFRA", "IREN": "AI_CLOUD_INFRA",
+    # AI software and data platforms
+    "PLTR": "AI_SOFTWARE", "SNOW": "AI_SOFTWARE", "NOW": "AI_SOFTWARE",
+    "CRM": "AI_SOFTWARE", "DDOG": "AI_SOFTWARE",
+    # Data-center real estate
+    "EQIX": "DATA_CENTER_REIT", "DLR": "DATA_CENTER_REIT",
 }
+
+
+THEME_TO_VALUATION_ARCHETYPE = {
+    "HYPERSCALER": "MEGA_CAP_PLATFORM",
+    "AI_COMPUTE": "AI_COMPUTE",
+    "WAFER_FOUNDRY": "WAFER_FOUNDRY",
+    "SEMI_EQUIPMENT": "SEMI_EQUIPMENT",
+    "SEMI_PROCESS_CONTROL": "SEMI_PROCESS_CONTROL",
+    "SEMICONDUCTOR_TEST": "SEMICONDUCTOR_TEST",
+    "ADVANCED_PACKAGING": "ADVANCED_PACKAGING",
+    "NETWORKING_OPTICS": "NETWORKING_OPTICS",
+    "PHOTONICS_OPTICS": "PHOTONICS_OPTICS",
+    "MEMORY_STORAGE": "MEMORY_STORAGE",
+    "DATA_CENTER_POWER": "DATA_CENTER_POWER",
+    "POWER_GENERATION": "POWER_GENERATION",
+    "REGULATED_UTILITY": "REGULATED_UTILITY",
+    "AI_CLOUD_INFRA": "AI_CLOUD_INFRA",
+    "AI_SOFTWARE": "AI_SOFTWARE",
+    "DATA_CENTER_REIT": "DATA_CENTER_REIT",
+    "GENERAL_AI": "GENERAL_AI",
+}
+
+
+SECONDARY_AI_EXPOSURE_OVERRIDES = {
+    # TSMC's primary economics are foundry manufacturing, while CoWoS/SoIC are
+    # strategically important secondary exposure—not a reason to value it as an OSAT.
+    "TSM": ("ADVANCED_PACKAGING",),
+    "AMAT": ("ADVANCED_PACKAGING",),
+    "LRCX": ("ADVANCED_PACKAGING",),
+}
+
+
+PACKAGING_ARCHETYPE_OVERRIDES = {
+    "AMKR": "PACKAGING_OSAT", "ASX": "PACKAGING_OSAT",
+    "3711.TW": "PACKAGING_OSAT", "6239.TW": "PACKAGING_OSAT",
+    "KLIC": "PACKAGING_EQUIPMENT", "BESI.AS": "PACKAGING_EQUIPMENT",
+    "0522.HK": "PACKAGING_EQUIPMENT",
+}
+
+TEST_ARCHETYPE_OVERRIDES = {
+    "TER": "SEMICONDUCTOR_TEST", "COHU": "SEMICONDUCTOR_TEST",
+    "ATEYY": "SEMICONDUCTOR_TEST", "6857.T": "SEMICONDUCTOR_TEST",
+    "FORM": "TEST_INTERFACE", "TPRO.MI": "TEST_INTERFACE",
+    "AEHR": "BURN_IN_TEST",
+}
+
+
+def infer_packaging_archetype(ticker, company_text=""):
+    symbol = str(ticker or "").strip().upper()
+    if symbol in PACKAGING_ARCHETYPE_OVERRIDES:
+        return PACKAGING_ARCHETYPE_OVERRIDES[symbol]
+    text = str(company_text or "").lower()
+    equipment_terms = (
+        "packaging equipment", "die attach", "die bonding", "wire bonding",
+        "assembly equipment", "hybrid bonding equipment",
+    )
+    return (
+        "PACKAGING_EQUIPMENT"
+        if any(term in text for term in equipment_terms)
+        else "PACKAGING_OSAT"
+    )
+
+
+def infer_test_archetype(ticker, company_text=""):
+    symbol = str(ticker or "").strip().upper()
+    if symbol in TEST_ARCHETYPE_OVERRIDES:
+        return TEST_ARCHETYPE_OVERRIDES[symbol]
+    text = str(company_text or "").lower()
+    if any(term in text for term in ("probe card", "wafer probe", "test interface")):
+        return "TEST_INTERFACE"
+    if any(term in text for term in ("burn-in", "wafer-level burn in", "reliability test")):
+        return "BURN_IN_TEST"
+    return "SEMICONDUCTOR_TEST"
 
 
 MEMORY_STORAGE_SUBTYPE_OVERRIDES = {
@@ -225,17 +369,23 @@ def memory_storage_valuation_policy(ticker, company_text=""):
             "peer_symbols": ["SNDK", "285A.T", "000660.KS", "005930.KS"],
             # HBM-led memory upcycles can change mix, margins and earnings power
             # faster than a trailing mid-cycle average. Keep normalization in the
-            # model, but give period-matched FY1/FY2 evidence meaningful weight.
+            # model, while requiring cash-flow/EBITDA corroboration before the
+            # period-matched earnings regime controls the result.
             "weights": {
-                "DCF": 0.05,
-                "Forward P/E": 0.45,
-                "Normalized P/E": 0.30,
-                "EV/EBITDA": 0.20,
+                "DCF": 0.15,
+                "Forward P/E": 0.30,
+                "Normalized P/E": 0.15,
+                "EV/EBITDA": 0.25,
+                "EV/FCF": 0.15,
             },
             "growth_cap": 0.65,
             "terminal_margin_floor": 0.12,
             "terminal_margin_cap": 0.42,
-            "forward_ebit_margin_cap": 0.95,
+            # A broad ceiling only. The report engine applies the tighter,
+            # company-specific envelope from current and next-quarter EPS/revenue.
+            # This still leaves room for a corroborated HBM margin regime without
+            # admitting impossible EBIT above revenue.
+            "forward_ebit_margin_cap": 0.90,
             "structural_forward_eps_weight": 0.72,
             "structural_forward_pe_floor": 6.5,
             "structural_normalized_pe_floor": 6.5,
@@ -261,6 +411,92 @@ def memory_storage_valuation_policy(ticker, company_text=""):
         "subtype": subtype,
         "label": "General Memory & Storage",
         "peer_symbols": ["MU", "SNDK", "WDC", "STX"],
+    }))
+
+
+DATA_CENTER_POWER_SUBTYPE_OVERRIDES = {
+    "BE": "DISTRIBUTED_POWER",
+    "VRT": "CRITICAL_POWER_COOLING", "CARR": "CRITICAL_POWER_COOLING",
+    "NVT": "CRITICAL_POWER_COOLING",
+    "ETN": "ELECTRICAL_EQUIPMENT", "GEV": "ELECTRICAL_EQUIPMENT",
+    "HUBB": "ELECTRICAL_EQUIPMENT",
+    "PWR": "POWER_CONSTRUCTION", "EME": "POWER_CONSTRUCTION",
+}
+
+
+def infer_data_center_power_subtype(ticker, company_text=""):
+    symbol = str(ticker or "").strip().upper()
+    if symbol in DATA_CENTER_POWER_SUBTYPE_OVERRIDES:
+        return DATA_CENTER_POWER_SUBTYPE_OVERRIDES[symbol]
+    text = str(company_text or "").lower()
+    if any(term in text for term in ("fuel cell", "distributed power", "microgrid")):
+        return "DISTRIBUTED_POWER"
+    if any(term in text for term in ("cooling", "thermal management", "ups system", "critical digital infrastructure")):
+        return "CRITICAL_POWER_COOLING"
+    if any(term in text for term in ("switchgear", "electrical equipment", "power management")):
+        return "ELECTRICAL_EQUIPMENT"
+    if any(term in text for term in ("engineering and construction", "electrical contractor", "infrastructure solutions")):
+        return "POWER_CONSTRUCTION"
+    return "GENERAL_DATA_CENTER_POWER"
+
+
+def data_center_power_valuation_policy(ticker, company_text=""):
+    """Separate economically different suppliers behind data-center power demand."""
+    subtype = infer_data_center_power_subtype(ticker, company_text)
+    policies = {
+        "DISTRIBUTED_POWER": {
+            "subtype": subtype,
+            "label": "Distributed / On-Site Data-Center Power",
+            "peer_symbols": ["VRT", "GEV", "FCEL", "PLUG"],
+            "weights": {"DCF": 0.05, "Forward P/E": 0.10, "EV/Sales": 0.65, "EV/EBITDA": 0.20},
+            "forecast_years": 10,
+            "sales_to_capital": 0.75,
+            "growth_cap": 0.45,
+            "terminal_margin_floor": 0.06,
+            "terminal_margin_cap": 0.28,
+            "outlier_band": (0.38, 2.45),
+        },
+        "CRITICAL_POWER_COOLING": {
+            "subtype": subtype,
+            "label": "Critical Power & Cooling Infrastructure",
+            "peer_symbols": ["VRT", "NVT", "CARR", "JCI"],
+            "weights": {"DCF": 0.15, "Forward P/E": 0.35, "EV/EBITDA": 0.35, "EV/FCF": 0.15},
+            "forecast_years": 9,
+            "sales_to_capital": 1.15,
+            "growth_cap": 0.35,
+            "terminal_margin_floor": 0.10,
+            "terminal_margin_cap": 0.32,
+            "outlier_band": (0.48, 2.10),
+        },
+        "ELECTRICAL_EQUIPMENT": {
+            "subtype": subtype,
+            "label": "Electrical Distribution & Grid Equipment",
+            "peer_symbols": ["ETN", "HUBB", "GEV", "ABBN.SW"],
+            "weights": {"DCF": 0.20, "Forward P/E": 0.35, "EV/EBITDA": 0.30, "EV/FCF": 0.15},
+            "forecast_years": 9,
+            "sales_to_capital": 1.10,
+            "growth_cap": 0.25,
+            "terminal_margin_floor": 0.12,
+            "terminal_margin_cap": 0.28,
+            "outlier_band": (0.55, 1.90),
+        },
+        "POWER_CONSTRUCTION": {
+            "subtype": subtype,
+            "label": "Power Engineering & Construction",
+            "peer_symbols": ["PWR", "EME", "FIX", "MTZ"],
+            "weights": {"DCF": 0.15, "Forward P/E": 0.35, "EV/EBITDA": 0.30, "EV/FCF": 0.20},
+            "forecast_years": 8,
+            "sales_to_capital": 1.65,
+            "growth_cap": 0.25,
+            "terminal_margin_floor": 0.04,
+            "terminal_margin_cap": 0.16,
+            "outlier_band": (0.55, 1.85),
+        },
+    }
+    return dict(policies.get(subtype, {
+        "subtype": subtype,
+        "label": "General Data-Center Power Infrastructure",
+        "peer_symbols": ["VRT", "ETN", "GEV", "PWR"],
     }))
 
 
@@ -389,6 +625,276 @@ def complete_forward_revenue_path(year_one, year_two, trailing_revenue, growth):
             growth_value = 0.0
         second = first * max(1.0 + growth_value, 0.01)
     return first, second
+
+
+def calendarize_fiscal_estimate(
+    current_fy_value,
+    next_fy_value,
+    current_fy_end,
+    *,
+    as_of=None,
+    target_days=365,
+):
+    """Calendarize FY0/FY+1 estimates to the actual 12-month target date.
+
+    Yahoo's `nextFiscalYearEnd` is the endpoint for its `0y` estimate. The `+1y`
+    estimate ends roughly one year later. Linear calendarization is preferable
+    to always extrapolating beyond FY+1, which materially distorted companies
+    with August and December fiscal year ends in opposite directions.
+    """
+    def number(value):
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def moment(value):
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, (int, float)):
+            try:
+                timestamp = float(value)
+                if timestamp > 10_000_000_000:
+                    timestamp /= 1000.0
+                parsed = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    fy0 = number(current_fy_value)
+    fy1 = number(next_fy_value)
+    if fy0 is None and fy1 is None:
+        return {"value": None, "next_fy_weight": None, "quality": "missing"}
+    if fy0 is None:
+        return {"value": fy1, "next_fy_weight": 1.0, "quality": "single-estimate fallback"}
+    if fy1 is None:
+        return {"value": fy0, "next_fy_weight": 0.0, "quality": "single-estimate fallback"}
+
+    now = moment(as_of) or datetime.now(timezone.utc)
+    fy0_end = moment(current_fy_end)
+    if fy0_end is None:
+        return {"value": fy1, "next_fy_weight": 1.0, "quality": "fiscal-date fallback"}
+    target_date = now + timedelta(days=max(int(target_days), 1))
+    next_fy_end = fy0_end + timedelta(days=365.2425)
+    span_seconds = (next_fy_end - fy0_end).total_seconds()
+    weight = (target_date - fy0_end).total_seconds() / span_seconds
+    weight = max(0.0, min(1.0, weight))
+    value = fy0 * (1.0 - weight) + fy1 * weight
+    return {"value": value, "next_fy_weight": weight, "quality": "calendarized"}
+
+
+def reconcile_forward_eps_estimate(
+    eps_value,
+    revenue_value,
+    share_count,
+    *,
+    quarterly_pairs=None,
+    current_net_margin=None,
+    absolute_margin_cap=0.90,
+):
+    """Validate an annual EPS estimate against period-matched quarterly evidence.
+
+    A static semiconductor margin ceiling fails in both directions: it rejects a
+    genuine HBM-driven margin regime and can still accept a malformed estimate for
+    a lower-margin OSAT or equipment vendor.  This guard derives a company-specific
+    envelope from 0q/+1q EPS and revenue, with current net margin as a secondary
+    anchor.  Values outside that envelope are shrunk transparently, never silently
+    rescaled by a guessed power of ten.
+    """
+    def positive(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    eps = positive(eps_value)
+    revenue = positive(revenue_value)
+    shares = positive(share_count)
+    if eps is None or revenue is None or shares is None:
+        return {
+            "value": None,
+            "status": "missing",
+            "implied_margin": None,
+            "margin_cap": None,
+            "quarterly_evidence_count": 0,
+        }
+
+    quarterly_margins = []
+    for pair in quarterly_pairs or []:
+        try:
+            quarterly_eps, quarterly_revenue = pair
+        except (TypeError, ValueError):
+            continue
+        quarterly_eps = positive(quarterly_eps)
+        quarterly_revenue = positive(quarterly_revenue)
+        if quarterly_eps is None or quarterly_revenue is None:
+            continue
+        margin = quarterly_eps * shares / quarterly_revenue
+        if math.isfinite(margin) and 0 <= margin <= absolute_margin_cap:
+            quarterly_margins.append(margin)
+
+    try:
+        current_margin = float(current_net_margin)
+        if not math.isfinite(current_margin):
+            current_margin = None
+    except (TypeError, ValueError):
+        current_margin = None
+
+    anchors = []
+    if quarterly_margins:
+        anchors.append(statistics.median(quarterly_margins) + 0.12)
+    if current_margin is not None and current_margin > -0.25:
+        anchors.append(max(current_margin, 0.0) + 0.12)
+
+    # Without quarter evidence, remain permissive enough for structural AI-cycle
+    # transitions while enforcing an absolute accounting sanity limit.
+    evidence_floor = 0.78 if not quarterly_margins else 0.35
+    margin_cap = min(
+        max(0.05, float(absolute_margin_cap)),
+        max([evidence_floor, *anchors]),
+    )
+    implied_margin = eps * shares / revenue
+    if not math.isfinite(implied_margin) or implied_margin < -0.25:
+        return {
+            "value": None,
+            "status": "invalid",
+            "implied_margin": implied_margin,
+            "margin_cap": margin_cap,
+            "quarterly_evidence_count": len(quarterly_margins),
+        }
+    if implied_margin <= margin_cap:
+        status = "quarter-corroborated" if quarterly_margins else "accepted"
+        return {
+            "value": eps,
+            "status": status,
+            "implied_margin": implied_margin,
+            "margin_cap": margin_cap,
+            "quarterly_evidence_count": len(quarterly_margins),
+        }
+
+    clipped_eps = margin_cap * revenue / shares
+    return {
+        "value": clipped_eps,
+        "status": "shrunk-to-evidence-envelope",
+        "implied_margin": implied_margin,
+        "margin_cap": margin_cap,
+        "quarterly_evidence_count": len(quarterly_margins),
+    }
+
+
+PEER_ISSUER_ALIASES = {
+    # ASE Technology is quoted both as the NYSE ADR and Taiwan ordinary share.
+    "ASX": "ASE_TECHNOLOGY",
+    "3711.TW": "ASE_TECHNOLOGY",
+}
+
+
+def dedupe_peer_symbols(subject_ticker, peer_symbols, *, limit=6):
+    """Remove self-peers and dual listings at the underlying-issuer level."""
+    subject = str(subject_ticker or "").strip().upper()
+    subject_issuer = PEER_ISSUER_ALIASES.get(subject, subject)
+    seen_issuers = {subject_issuer}
+    result = []
+    for raw_symbol in peer_symbols or []:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            continue
+        issuer = PEER_ISSUER_ALIASES.get(symbol, symbol)
+        if issuer in seen_issuers:
+            continue
+        seen_issuers.add(issuer)
+        result.append(symbol)
+        if len(result) >= max(int(limit), 0):
+            break
+    return result
+
+
+METHOD_FAMILIES = {
+    "DCF": "intrinsic",
+    "Forward P/E": "earnings-relative",
+    "Normalized P/E": "earnings-relative",
+    "EV/EBITDA": "enterprise-relative",
+    "EV/Sales": "enterprise-relative",
+    "EV/FCF": "cash-flow-relative",
+}
+
+
+def robust_method_composite(values, weights, band=(0.50, 2.00)):
+    """Blend valuation methods without rewriting any method output.
+
+    The previous winsorizer moved a low DCF upward toward peer multiples. That
+    created artificial agreement. Here every displayed value remains raw; only
+    its effective weight is reduced when it falls outside the configured robust
+    band. Diagnostics expose both the adjusted weights and method-family count.
+    """
+    valid = {}
+    for method, value in (values or {}).items():
+        try:
+            number = float(value)
+            weight = float((weights or {}).get(method, 0.0))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number > 0 and math.isfinite(weight) and weight > 0:
+            valid[method] = number
+    if not valid:
+        return {
+            "value": None,
+            "used_values": {},
+            "effective_weights": {},
+            "downweighted_methods": [],
+            "family_count": 0,
+        }
+
+    center = statistics.median(valid.values())
+    low_factor, high_factor = band
+    low_boundary = center * max(float(low_factor), 0.01)
+    high_boundary = center * max(float(high_factor), float(low_factor), 0.02)
+    reliability = {}
+    downweighted = []
+    for method, value in valid.items():
+        if value < low_boundary:
+            distance = abs(math.log(max(value, 1e-12) / low_boundary))
+        elif value > high_boundary:
+            distance = abs(math.log(value / high_boundary))
+        else:
+            distance = 0.0
+        reliability[method] = max(0.15, math.exp(-1.5 * distance))
+        if distance > 0:
+            downweighted.append(method)
+
+    raw_effective = {
+        method: float(weights[method]) * reliability[method]
+        for method in valid
+    }
+    total = sum(raw_effective.values())
+    if total <= 0:
+        return {
+            "value": None,
+            "used_values": valid,
+            "effective_weights": {},
+            "downweighted_methods": downweighted,
+            "family_count": len({METHOD_FAMILIES.get(key, key) for key in valid}),
+        }
+    effective_weights = {
+        method: weight / total for method, weight in raw_effective.items()
+    }
+    composite = sum(valid[method] * effective_weights[method] for method in valid)
+    return {
+        "value": composite,
+        "used_values": valid,
+        "effective_weights": effective_weights,
+        "downweighted_methods": downweighted,
+        "family_count": len({METHOD_FAMILIES.get(key, key) for key in valid}),
+    }
 
 
 def filter_non_monotonic_scenario_methods(raw_by_scenario):
@@ -579,7 +1085,18 @@ def robust_analyst_target_policy(
         "MEMORY_STORAGE": 0.40,
         "WAFER_FOUNDRY": 0.38,
         "SEMI_EQUIPMENT": 0.34,
+        "SEMI_PROCESS_CONTROL": 0.34,
+        "SEMICONDUCTOR_TEST": 0.34,
+        "TEST_INTERFACE": 0.32,
+        "BURN_IN_TEST": 0.28,
+        "PACKAGING_OSAT": 0.34,
+        "PACKAGING_EQUIPMENT": 0.34,
         "AI_COMPUTE": 0.34,
+        "NETWORKING_OPTICS": 0.34,
+        "PHOTONICS_OPTICS": 0.32,
+        "DATA_CENTER_POWER": 0.32,
+        "POWER_GENERATION": 0.30,
+        "REGULATED_UTILITY": 0.25,
     }
     weight_cap = cap_by_archetype.get(str(archetype or "").upper(), 0.30)
     reliability *= reliability_multiplier
@@ -699,12 +1216,74 @@ def infer_ai_theme(ticker, company_text=""):
     if symbol in TICKER_THEME_OVERRIDES:
         return TICKER_THEME_OVERRIDES[symbol]
     haystack = str(company_text or "").lower()
+    # Primary-business phrases outrank incidental end-market words. An OSAT may
+    # mention NAND and testing repeatedly; that does not make it a memory maker or
+    # an ATE vendor. Conversely, a foundry offering CoWoS remains a foundry.
+    if any(term in haystack for term in ("pure-play foundry", "wafer foundry")):
+        return "WAFER_FOUNDRY"
+    if any(term in haystack for term in (
+        "outsourced semiconductor assembly and test",
+        "outsourced semiconductor assembly",
+        "semiconductor packaging and test services",
+    )):
+        return "ADVANCED_PACKAGING"
+    if any(term in haystack for term in ("automated test equipment", "semiconductor test equipment")):
+        return "SEMICONDUCTOR_TEST"
     matches = []
     for theme, keywords in AI_THEME_KEYWORDS.items():
         count = sum(1 for keyword in keywords if keyword in haystack)
         if count:
-            matches.append((count, theme))
-    return max(matches)[1] if matches else "GENERAL_AI"
+            matches.append((count, AI_THEME_PRIORITY.get(theme, 0), theme))
+    return max(matches)[2] if matches else "GENERAL_AI"
+
+
+def infer_secondary_ai_exposures(ticker, company_text=""):
+    """Return relevant AI-chain exposures without changing primary economics."""
+    symbol = str(ticker or "").strip().upper()
+    primary = infer_ai_theme(symbol, company_text)
+    haystack = str(company_text or "").lower()
+    exposures = set(SECONDARY_AI_EXPOSURE_OVERRIDES.get(symbol, ()))
+    for theme, keywords in AI_THEME_KEYWORDS.items():
+        if theme != primary and any(keyword in haystack for keyword in keywords):
+            exposures.add(theme)
+    return sorted(
+        exposures,
+        key=lambda theme: (-AI_THEME_PRIORITY.get(theme, 0), theme),
+    )
+
+
+def infer_valuation_archetype(
+    ticker,
+    company_text="",
+    *,
+    sector="",
+    market_cap=None,
+):
+    """Map the shared evidence taxonomy to one valuation architecture.
+
+    Both headline relevance and fundamental valuation call this boundary so a
+    packaging, test, or power supplier cannot receive two conflicting labels in
+    the same report.
+    """
+    theme = infer_ai_theme(ticker, company_text)
+    if theme == "ADVANCED_PACKAGING":
+        return infer_packaging_archetype(ticker, company_text)
+    if theme == "SEMICONDUCTOR_TEST":
+        return infer_test_archetype(ticker, company_text)
+    archetype = THEME_TO_VALUATION_ARCHETYPE.get(theme, "GENERAL_AI")
+    try:
+        market_cap_value = float(market_cap)
+    except (TypeError, ValueError):
+        market_cap_value = 0.0
+    if (
+        archetype == "GENERAL_AI"
+        and math.isfinite(market_cap_value)
+        and market_cap_value >= 250_000_000_000
+        and str(sector or "").strip().lower()
+        in {"technology", "communication services", "consumer cyclical"}
+    ):
+        return "MEGA_CAP_PLATFORM"
+    return archetype
 
 
 def current_calendar_year(value, *, as_of=None):
@@ -829,7 +1408,10 @@ def author_reputation(item, configured=None):
 
 def _ticker_is_ambiguous(ticker):
     ticker = str(ticker or "").strip().upper()
-    return len(ticker) <= 2 or ticker in {"AI", "IT", "ON", "ALL", "NOW", "SO", "A", "C", "F"}
+    return len(ticker) <= 2 or ticker in {
+        "AI", "IT", "ON", "ALL", "NOW", "SO", "A", "C", "F",
+        "ARM", "FORM", "FIX",
+    }
 
 
 def relevance_score(item, ticker, company_name, theme="GENERAL_AI"):
@@ -1109,15 +1691,34 @@ def _get_x_recent(session, ticker, company_name, bearer_token, timeout):
         return [], f"X official recent-search API: {type(exc).__name__}"
 
 
-def collect_public_items(ticker, company_name, *, yahoo_items=None, session=None, timeout=10):
+def collect_public_items(
+    ticker,
+    company_name,
+    *,
+    yahoo_items=None,
+    session=None,
+    timeout=10,
+    theme=None,
+):
     """Collect public metadata from Yahoo, Google, GDELT, Reddit, and optional X API."""
     session = session or requests.Session()
     rows = normalize_yahoo_news(yahoo_items or [])
     diagnostics = []
     year = _utc_now().year
     quoted_company = f'"{company_name}"' if company_name else ticker
+    theme = theme or infer_ai_theme(ticker, company_name)
+    theme_query = {
+        "ADVANCED_PACKAGING": '(CoWoS OR SoIC OR "hybrid bonding" OR OSAT OR "advanced packaging")',
+        "SEMICONDUCTOR_TEST": '("semiconductor test" OR "probe card" OR "wafer probe" OR "book-to-bill")',
+        "SEMI_PROCESS_CONTROL": '(metrology OR inspection OR yield OR backlog)',
+        "WAFER_FOUNDRY": '(foundry OR wafer OR node OR utilization OR CoWoS)',
+        "MEMORY_STORAGE": '(HBM OR DRAM OR NAND OR memory OR pricing)',
+        "PHOTONICS_OPTICS": '(photonics OR transceiver OR optical OR laser)',
+        "DATA_CENTER_POWER": '("data center power" OR switchgear OR backlog OR "liquid cooling" OR microgrid)',
+        "POWER_GENERATION": '("data center demand" OR capacity OR power OR generation)',
+    }.get(theme, '(earnings OR guidance OR contract OR "data center" OR AI)')
     queries = [
-        f'{quoted_company} {ticker} stock (earnings OR guidance OR contract OR data center OR AI)',
+        f'{quoted_company} {ticker} stock {theme_query}',
         f'{quoted_company} {ticker} ("price target" OR upgrade OR downgrade) after:{year}-01-01',
     ]
     for number, query in enumerate(queries, start=1):
@@ -1562,7 +2163,11 @@ def build_market_intelligence(
     """End-to-end public-evidence collection with deterministic graceful fallback."""
     theme = infer_ai_theme(ticker, company_text)
     raw_items, diagnostics = collect_public_items(
-        ticker, company_name, yahoo_items=yahoo_items, session=session,
+        ticker,
+        company_name,
+        yahoo_items=yahoo_items,
+        session=session,
+        theme=theme,
     )
     try:
         lookback_days = int(lookback_days or os.environ.get("MARKET_SENTIMENT_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS))

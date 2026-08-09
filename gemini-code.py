@@ -29,24 +29,31 @@ import math
 import requests
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from urllib.parse import urlparse
 from stock_intelligence import (
     apply_directional_scenario_shift,
     build_market_intelligence,
+    calendarize_fiscal_estimate,
     complete_forward_revenue_path,
     convert_currency_amount,
     currency_pair_candidates,
     current_calendar_year,
+    data_center_power_valuation_policy,
+    dedupe_peer_symbols,
     extract_current_year_analyst_targets,
     filter_non_monotonic_scenario_methods,
+    infer_valuation_archetype,
+    infer_secondary_ai_exposures,
     memory_storage_valuation_policy,
     normalize_currency_code,
     normalize_scenario_estimates,
     normalize_yahoo_analyst_history,
     quote_equivalent_share_count,
+    reconcile_forward_eps_estimate,
     robust_analyst_target_policy,
+    robust_method_composite,
     validate_current_year_analyst_record,
 )
 try:
@@ -70,6 +77,8 @@ except ImportError:
 # generation remain independent of this optional enrichment.
 _GEMINI_GROUNDING_DISABLED = False
 _GEMINI_GROUNDING_DISABLE_REASON = ""
+REPORT_ENGINE_VERSION = "9.1"
+REPORT_FILE_VERSION = "v9_1"
 
 
 
@@ -768,11 +777,22 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         eps_revisions = pd.DataFrame()
 
     next_year_revenue_growth = frame_cell(revenue_estimates, "+1y", "growth", None)
-    long_term_growth_estimate = frame_cell(growth_estimates, "+5y", "stock", None)
+    # yfinance's current schema exposes long-term growth as LTG/stockTrend.
+    # Retain the legacy lookup only as a compatibility fallback.
+    long_term_growth_estimate = (
+        frame_cell(growth_estimates, "LTG", "stockTrend", None)
+        or frame_cell(growth_estimates, "+5y", "stock", None)
+    )
     if next_year_revenue_growth is None:
         next_year_revenue_growth = revenue_cagr if revenue_cagr is not None else info.get("revenueGrowth")
     if long_term_growth_estimate is None:
-        long_term_growth_estimate = info.get("earningsGrowth") or revenue_cagr
+        # A one-year EPS rebound can be several hundred percent at the bottom of
+        # a semiconductor cycle; it is not a defensible perpetual growth input.
+        long_term_growth_estimate = (
+            revenue_cagr
+            if revenue_cagr is not None
+            else info.get("revenueGrowth") or info.get("earningsGrowth")
+        )
     next_year_revenue_growth = clamp(next_year_revenue_growth if next_year_revenue_growth is not None else 0.06, -0.15, 0.35)
     long_term_growth_estimate = clamp(long_term_growth_estimate if long_term_growth_estimate is not None else 0.06, 0.01, 0.20)
 
@@ -842,58 +862,25 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     USE_ANALYST_OPERATING_ESTIMATES = True
     MANUAL_ARCHETYPE = None  # Example: "MEMORY_STORAGE"; leave None for auto-classification.
 
-    # Explicit AI value-chain taxonomy. Unknown tickers are classified from business
-    # description, industry, profitability and growth. Users can add overrides safely.
-    TICKER_ARCHETYPE_OVERRIDES = {
-        # AI compute / semiconductor design
-        "NVDA": "AI_COMPUTE", "AMD": "AI_COMPUTE", "AVGO": "AI_COMPUTE",
-        "MRVL": "AI_COMPUTE", "CRDO": "AI_COMPUTE", "ARM": "AI_COMPUTE",
-        # Memory / storage cycle
-        "MU": "MEMORY_STORAGE", "WDC": "MEMORY_STORAGE", "STX": "MEMORY_STORAGE",
-        "SNDK": "MEMORY_STORAGE", "SIMO": "MEMORY_STORAGE", "RMBS": "MEMORY_STORAGE",
-        # Semiconductor equipment / process control
-        "ASML": "SEMI_EQUIPMENT", "AMAT": "SEMI_EQUIPMENT", "LRCX": "SEMI_EQUIPMENT",
-        "KLAC": "SEMI_EQUIPMENT", "ONTO": "SEMI_EQUIPMENT", "CAMT": "SEMI_EQUIPMENT",
-        "ACMR": "SEMI_EQUIPMENT", "UCTT": "SEMI_EQUIPMENT", "MKSI": "SEMI_EQUIPMENT",
-        # Wafer foundries / fabrication
-        "TSM": "WAFER_FOUNDRY", "INTC": "WAFER_FOUNDRY", "GFS": "WAFER_FOUNDRY",
-        "UMC": "WAFER_FOUNDRY", "SMIC": "WAFER_FOUNDRY",
-        # Networking, switching, photonics and interconnect
-        "ANET": "NETWORKING_OPTICS",
-        "COHR": "PHOTONICS_OPTICS", "LITE": "PHOTONICS_OPTICS",
-        "AAOI": "PHOTONICS_OPTICS", "FN": "PHOTONICS_OPTICS",
-        "IPGP": "PHOTONICS_OPTICS", "CIEN": "PHOTONICS_OPTICS",
-        # Data-center electrical, cooling and distributed power
-        "VRT": "DATA_CENTER_POWER", "ETN": "DATA_CENTER_POWER", "GEV": "DATA_CENTER_POWER",
-        "PWR": "DATA_CENTER_POWER", "CARR": "DATA_CENTER_POWER", "BE": "DATA_CENTER_POWER",
-        # AI cloud / GPU infrastructure
-        "CRWV": "AI_CLOUD_INFRA", "NBIS": "AI_CLOUD_INFRA", "IREN": "AI_CLOUD_INFRA",
-        # AI software / data platforms
-        "PLTR": "AI_SOFTWARE", "SNOW": "AI_SOFTWARE", "NOW": "AI_SOFTWARE",
-        "CRM": "AI_SOFTWARE", "DDOG": "AI_SOFTWARE",
-        # Hyperscalers and mega-cap platforms
-        "MSFT": "MEGA_CAP_PLATFORM", "GOOGL": "MEGA_CAP_PLATFORM", "GOOG": "MEGA_CAP_PLATFORM",
-        "AMZN": "MEGA_CAP_PLATFORM", "META": "MEGA_CAP_PLATFORM", "AAPL": "MEGA_CAP_PLATFORM",
-        "ORCL": "MEGA_CAP_PLATFORM",
-        # Power generators benefiting from data-center load growth
-        "CEG": "POWER_GENERATION", "VST": "POWER_GENERATION", "NRG": "POWER_GENERATION",
-        "TLN": "POWER_GENERATION", "NEE": "POWER_GENERATION", "AEP": "POWER_GENERATION",
-        # Data-center real estate
-        "EQIX": "DATA_CENTER_REIT", "DLR": "DATA_CENTER_REIT",
-    }
-
     PEER_GROUPS = {
         "AI_COMPUTE": ["NVDA", "AMD", "AVGO", "MRVL", "CRDO", "ARM"],
         "MEMORY_STORAGE": ["MU", "WDC", "STX", "SNDK", "SIMO", "RMBS"],
-        "SEMI_EQUIPMENT": ["ASML", "AMAT", "LRCX", "KLAC", "ONTO", "CAMT"],
-        "WAFER_FOUNDRY": ["TSM", "INTC", "GFS", "UMC"],
+        "SEMI_EQUIPMENT": ["ASML", "AMAT", "LRCX", "ACMR", "ACLS", "MKSI"],
+        "SEMI_PROCESS_CONTROL": ["KLAC", "ONTO", "CAMT", "NVMI"],
+        "SEMICONDUCTOR_TEST": ["TER", "COHU", "ATEYY", "6857.T"],
+        "TEST_INTERFACE": ["FORM", "TPRO.MI", "TER", "COHU"],
+        "BURN_IN_TEST": ["AEHR", "FORM", "COHU", "TER"],
+        "PACKAGING_OSAT": ["AMKR", "ASX", "3711.TW", "6239.TW"],
+        "PACKAGING_EQUIPMENT": ["KLIC", "BESI.AS", "0522.HK"],
+        "WAFER_FOUNDRY": ["TSM", "GFS", "UMC", "0981.HK"],
         "NETWORKING_OPTICS": ["ANET", "AVGO", "MRVL", "CRDO"],
         "PHOTONICS_OPTICS": ["COHR", "LITE", "AAOI", "FN", "IPGP", "CIEN"],
-        "DATA_CENTER_POWER": ["VRT", "ETN", "GEV", "PWR", "CARR", "BE"],
+        "DATA_CENTER_POWER": ["VRT", "NVT", "ETN", "HUBB"],
         "AI_CLOUD_INFRA": ["CRWV", "NBIS", "IREN", "VRT", "ANET"],
         "AI_SOFTWARE": ["PLTR", "SNOW", "NOW", "CRM", "DDOG"],
         "MEGA_CAP_PLATFORM": ["MSFT", "GOOGL", "AMZN", "META", "ORCL"],
-        "POWER_GENERATION": ["CEG", "VST", "NRG", "GEV", "TLN", "NEE"],
+        "POWER_GENERATION": ["CEG", "VST", "NRG", "TLN"],
+        "REGULATED_UTILITY": ["NEE", "AEP", "DUK", "SO", "D"],
         "DATA_CENTER_REIT": ["EQIX", "DLR"],
         "GENERAL_AI": ["MSFT", "NVDA", "AVGO", "VRT", "ANET"],
     }
@@ -902,6 +889,12 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         "AI_COMPUTE": "AI Compute Semiconductors",
         "MEMORY_STORAGE": "Memory & Storage Cycle",
         "SEMI_EQUIPMENT": "Semiconductor Equipment",
+        "SEMI_PROCESS_CONTROL": "Semiconductor Process Control & Inspection",
+        "SEMICONDUCTOR_TEST": "Semiconductor Automated Test Equipment",
+        "TEST_INTERFACE": "Semiconductor Test Interface & Probe Cards",
+        "BURN_IN_TEST": "Semiconductor Burn-In & Reliability Test",
+        "PACKAGING_OSAT": "Advanced Packaging & Outsourced Assembly/Test",
+        "PACKAGING_EQUIPMENT": "Advanced-Packaging Equipment",
         "WAFER_FOUNDRY": "Semiconductor Foundry / Wafer Fabrication",
         "NETWORKING_OPTICS": "AI Networking & Switching",
         "PHOTONICS_OPTICS": "AI Photonics & Optical Interconnect",
@@ -910,6 +903,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         "AI_SOFTWARE": "AI Software & Data Platforms",
         "MEGA_CAP_PLATFORM": "Mega-Cap Platform / Hyperscaler",
         "POWER_GENERATION": "Power Generation",
+        "REGULATED_UTILITY": "Regulated Electric Utility",
         "DATA_CENTER_REIT": "Data-Center Real Estate",
         "GENERAL_AI": "General AI Value Chain",
     }
@@ -936,8 +930,52 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             "terminal_margin_floor": 0.16, "terminal_margin_cap": 0.38,
             "rd_life": 5, "outlier_band": (0.50, 2.00),
         },
+        "SEMI_PROCESS_CONTROL": {
+            "weights": {"DCF": 0.20, "Forward P/E": 0.45, "EV/EBITDA": 0.25, "EV/FCF": 0.10},
+            "forecast_years": 9, "sales_to_capital": 1.40, "growth_cap": 0.34,
+            "terminal_margin_floor": 0.18, "terminal_margin_cap": 0.48,
+            "rd_life": 5, "outlier_band": (0.52, 1.95),
+        },
+        "SEMICONDUCTOR_TEST": {
+            "weights": {"DCF": 0.15, "Forward P/E": 0.45, "EV/EBITDA": 0.30, "EV/FCF": 0.10},
+            "forecast_years": 9, "sales_to_capital": 1.35, "growth_cap": 0.38,
+            "terminal_margin_floor": 0.12, "terminal_margin_cap": 0.38,
+            "rd_life": 5, "outlier_band": (0.48, 2.10),
+        },
+        "TEST_INTERFACE": {
+            "weights": {"DCF": 0.15, "Forward P/E": 0.40, "EV/EBITDA": 0.35, "EV/FCF": 0.10},
+            "forecast_years": 9, "sales_to_capital": 1.25, "growth_cap": 0.38,
+            "terminal_margin_floor": 0.10, "terminal_margin_cap": 0.35,
+            "rd_life": 5, "outlier_band": (0.45, 2.15),
+        },
+        "BURN_IN_TEST": {
+            "weights": {"DCF": 0.10, "Forward P/E": 0.40, "EV/Sales": 0.30, "EV/EBITDA": 0.20},
+            "forecast_years": 9, "sales_to_capital": 1.20, "growth_cap": 0.45,
+            "terminal_margin_floor": 0.06, "terminal_margin_cap": 0.30,
+            "rd_life": 5, "outlier_band": (0.40, 2.30),
+        },
+        "PACKAGING_OSAT": {
+            "weights": {"DCF": 0.20, "Forward P/E": 0.35, "EV/EBITDA": 0.45},
+            "forecast_years": 8, "sales_to_capital": 0.75, "growth_cap": 0.32,
+            "terminal_margin_floor": 0.06, "terminal_margin_cap": 0.22,
+            "rd_life": 4, "outlier_band": (0.55, 1.90),
+        },
+        "PACKAGING_EQUIPMENT": {
+            "weights": {"DCF": 0.15, "Forward P/E": 0.45, "EV/EBITDA": 0.25, "EV/FCF": 0.15},
+            "forecast_years": 9, "sales_to_capital": 1.40, "growth_cap": 0.38,
+            "terminal_margin_floor": 0.12, "terminal_margin_cap": 0.38,
+            "rd_life": 5, "outlier_band": (0.48, 2.10),
+        },
         "WAFER_FOUNDRY": {
-            "weights": {"DCF": 0.25, "Forward P/E": 0.35, "EV/EBITDA": 0.40},
+            # TSM has no clean public leading-edge peer. Favor its own forward
+            # earnings and intrinsic economics; mature-node peers are a check,
+            # not the controlling signal.
+            "weights": {
+                "DCF": 0.20,
+                "Forward P/E": 0.55,
+                "EV/EBITDA": 0.15,
+                "EV/FCF": 0.10,
+            },
             "forecast_years": 10, "sales_to_capital": 0.72, "growth_cap": 0.32,
             "terminal_margin_floor": 0.14, "terminal_margin_cap": 0.46,
             "rd_life": 6, "outlier_band": (0.48, 2.05),
@@ -984,6 +1022,12 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             "terminal_margin_floor": 0.10, "terminal_margin_cap": 0.35,
             "rd_life": 6, "outlier_band": (0.50, 1.95),
         },
+        "REGULATED_UTILITY": {
+            "weights": {"DCF": 0.45, "Forward P/E": 0.20, "EV/EBITDA": 0.35},
+            "forecast_years": 8, "sales_to_capital": 0.45, "growth_cap": 0.16,
+            "terminal_margin_floor": 0.12, "terminal_margin_cap": 0.38,
+            "rd_life": 7, "outlier_band": (0.60, 1.75),
+        },
         "DATA_CENTER_REIT": {
             "weights": {"DCF": 0.35, "EV/EBITDA": 0.65},
             "forecast_years": 8, "sales_to_capital": 0.45, "growth_cap": 0.22,
@@ -997,6 +1041,20 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             "rd_life": 4, "outlier_band": (0.45, 2.15),
         },
     }
+
+    taxonomy_keys = set(ARCHETYPE_CONFIG)
+    if taxonomy_keys != set(ARCHETYPE_LABELS) or taxonomy_keys != set(PEER_GROUPS):
+        raise ValueError(
+            "Stock valuation taxonomy is incomplete: every architecture must have "
+            "one label, configuration, and peer group."
+        )
+    for archetype_name, archetype_config in ARCHETYPE_CONFIG.items():
+        method_weight_total = sum(archetype_config.get("weights", {}).values())
+        if not math.isclose(method_weight_total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                f"Invalid valuation weights for {archetype_name}: "
+                f"expected 1.0, received {method_weight_total:.6f}."
+            )
 
 
     def estimate_value(frame, period, column, default=None):
@@ -1067,6 +1125,28 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     eps_1y_low = normalize_per_share_quote(estimate_value(earnings_estimates, "+1y", "low"))
     eps_1y_high = normalize_per_share_quote(estimate_value(earnings_estimates, "+1y", "high"))
 
+    # Use current and next-quarter estimates only as a consistency gate for the
+    # annual EPS/revenue margin. They are not capitalized as separate forecasts.
+    quarterly_revenue_reference = revenue_ttm / 4 if revenue_ttm else None
+    rev_0q_avg = plausible_estimate(
+        estimate_value(revenue_estimates, "0q", "avg"),
+        quarterly_revenue_reference,
+        low_factor=0.15,
+        high_factor=6.0,
+    )
+    rev_1q_avg = plausible_estimate(
+        estimate_value(revenue_estimates, "+1q", "avg"),
+        rev_0q_avg or quarterly_revenue_reference,
+        low_factor=0.35,
+        high_factor=3.0,
+    )
+    eps_0q_avg = normalize_per_share_quote(
+        estimate_value(earnings_estimates, "0q", "avg")
+    )
+    eps_1q_avg = normalize_per_share_quote(
+        estimate_value(earnings_estimates, "+1q", "avg")
+    )
+
     rev_0y_low, rev_0y_avg, rev_0y_high = normalize_scenario_estimates(
         rev_0y_low, rev_0y_avg, rev_0y_high
     )
@@ -1114,49 +1194,40 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     def classify_ai_archetype():
         if MANUAL_ARCHETYPE in ARCHETYPE_CONFIG:
             return MANUAL_ARCHETYPE
-        symbol = TICKER_SYMBOL.upper()
-        if symbol in TICKER_ARCHETYPE_OVERRIDES:
-            return TICKER_ARCHETYPE_OVERRIDES[symbol]
-
-        text = " ".join([
+        company_text = " ".join([
             str(company_name), str(sector), str(industry),
             str(info.get("longBusinessSummary") or "")
-        ]).lower()
-        rules = [
-            ("MEMORY_STORAGE", ["memory chip", "dram", "nand", "storage device", "hard disk"]),
-            ("WAFER_FOUNDRY", ["semiconductor foundry", "wafer fabrication", "wafer fab", "chip manufacturing", "process node"]),
-            ("SEMI_EQUIPMENT", ["semiconductor equipment", "process control", "lithography", "wafer equipment", "metrology"]),
-            ("PHOTONICS_OPTICS", ["silicon photonics", "photonics", "optical transceiver", "co-packaged optics", "laser diode"]),
-            ("NETWORKING_OPTICS", ["network switch", "networking equipment", "ethernet switching"]),
-            ("DATA_CENTER_POWER", ["fuel cell", "electrical equipment", "power management", "cooling", "thermal management"]),
-            ("AI_SOFTWARE", ["application software", "cloud software", "data analytics", "artificial intelligence software"]),
-            ("AI_COMPUTE", ["graphics processor", "gpu", "semiconductor design", "integrated circuits"]),
-            ("MEGA_CAP_PLATFORM", ["hyperscale cloud", "cloud platform", "cloud infrastructure", "hyperscaler"]),
-            ("POWER_GENERATION", ["independent power producer", "electric generation", "nuclear power"]),
-            ("DATA_CENTER_REIT", ["data center reit", "real estate investment trust"]),
-        ]
-        for archetype, keywords in rules:
-            if any(keyword in text for keyword in keywords):
-                return archetype
-        if market_cap >= 250_000_000_000 and str(sector).lower() in {
-            "technology", "communication services", "consumer cyclical"
-        }:
-            return "MEGA_CAP_PLATFORM"
-        return "GENERAL_AI"
+        ])
+        return infer_valuation_archetype(
+            TICKER_SYMBOL,
+            company_text,
+            sector=sector,
+            market_cap=market_cap,
+        )
 
 
     valuation_archetype_id = classify_ai_archetype()
     valuation_archetype = ARCHETYPE_LABELS[valuation_archetype_id]
     config = dict(ARCHETYPE_CONFIG[valuation_archetype_id])
     memory_policy = None
+    power_policy = None
+    valuation_policy = None
+    company_profile_text = " ".join([
+        str(company_name), str(sector), str(industry),
+        str(info.get("longBusinessSummary") or ""),
+    ])
+    secondary_ai_exposures = infer_secondary_ai_exposures(
+        TICKER_SYMBOL, company_profile_text
+    )
+    secondary_ai_exposure_text = (
+        ", ".join(theme.replace("_", " ").title() for theme in secondary_ai_exposures)
+        if secondary_ai_exposures else "None separately identified"
+    )
     if valuation_archetype_id == "MEMORY_STORAGE":
         memory_policy = memory_storage_valuation_policy(
-            TICKER_SYMBOL,
-            " ".join([
-                str(company_name), str(sector), str(industry),
-                str(info.get("longBusinessSummary") or ""),
-            ]),
+            TICKER_SYMBOL, company_profile_text
         )
+        valuation_policy = memory_policy
         for field in (
             "weights", "growth_cap", "terminal_margin_floor",
             "terminal_margin_cap", "outlier_band",
@@ -1164,6 +1235,21 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             if field in memory_policy:
                 config[field] = memory_policy[field]
         valuation_archetype = f"{valuation_archetype} — {memory_policy['label']}"
+
+    if valuation_archetype_id == "DATA_CENTER_POWER":
+        power_policy = data_center_power_valuation_policy(
+            TICKER_SYMBOL, company_profile_text
+        )
+        valuation_policy = power_policy
+        for field in (
+            "weights", "forecast_years", "sales_to_capital", "growth_cap",
+            "terminal_margin_floor", "terminal_margin_cap", "outlier_band",
+        ):
+            if field in power_policy:
+                config[field] = power_policy[field]
+        valuation_archetype = (
+            f"{valuation_archetype} - {power_policy['label']}"
+        )
 
     # A stage overlay matters as much as sector. Bloom Energy and Eaton both benefit
     # from data-center power demand, but one may require an EV/Sales / margin-ramp
@@ -1181,7 +1267,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     ) >= 0.15
     high_growth_stage = weak_profitability and high_growth_signal
 
-    if valuation_archetype_id == "DATA_CENTER_POWER" and high_growth_stage:
+    if (
+        valuation_archetype_id == "DATA_CENTER_POWER"
+        and high_growth_stage
+        and (not power_policy or power_policy.get("subtype") == "GENERAL_DATA_CENTER_POWER")
+    ):
         # BE-like high-growth power platform: earnings multiples are not yet reliable.
         config = dict(config)
         config["weights"] = {"DCF": 0.05, "EV/Sales": 0.80, "EV/EBITDA": 0.15}
@@ -1274,10 +1364,10 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     peer_universe = (
-        memory_policy.get("peer_symbols", [])
-        if memory_policy else PEER_GROUPS[valuation_archetype_id]
+        valuation_policy.get("peer_symbols", [])
+        if valuation_policy else PEER_GROUPS[valuation_archetype_id]
     )
-    peer_symbols = [s for s in peer_universe if s != TICKER_SYMBOL.upper()][:6]
+    peer_symbols = dedupe_peer_symbols(TICKER_SYMBOL, peer_universe, limit=6)
     peer_data = [peer_snapshot(symbol) for symbol in peer_symbols]
     peer_data = [item for item in peer_data if item]
     peer_count = len(peer_data)
@@ -1303,17 +1393,26 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             value = frame_cell(frame, period, column, None)
             if value is not None:
                 return max(int(value), 0)
-        return consensus_analyst_count or 0
+        # Price-target opinion count is not a substitute for operating-estimate
+        # coverage; keep missing revenue/EPS breadth at zero.
+        return 0
 
 
-    operating_estimate_count = max(
-        estimate_analyst_count(revenue_estimates, "+1y"),
-        estimate_analyst_count(earnings_estimates, "+1y"),
+    revenue_estimate_count = estimate_analyst_count(revenue_estimates, "+1y")
+    eps_estimate_count = estimate_analyst_count(earnings_estimates, "+1y")
+    operating_estimate_count = max(revenue_estimate_count, eps_estimate_count)
+    # Revenue breadth must not lend false confidence to a thin EPS estimate (or
+    # vice versa). Keep the two evidence weights separate throughout the model.
+    revenue_estimate_weight = clamp(
+        0.50 + 0.012 * revenue_estimate_count, 0.50, 0.80
     )
-    # The model uses consensus operating estimates more heavily when coverage is broad,
-    # but never more than 80%; the remaining weight comes from company and peer data.
-    operating_estimate_weight = clamp(0.50 + 0.012 * operating_estimate_count, 0.50, 0.80)
+    eps_estimate_weight = clamp(
+        0.35 + 0.025 * eps_estimate_count, 0.35, 0.80
+    )
+    operating_estimate_weight = revenue_estimate_weight
     if not USE_ANALYST_OPERATING_ESTIMATES:
+        revenue_estimate_weight = 0.0
+        eps_estimate_weight = 0.0
         operating_estimate_weight = 0.0
 
     historical_growth_anchor = finite_median([
@@ -1342,8 +1441,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         return weight * consensus_value + (1 - weight) * standalone_value
 
 
-    forward_revenue_year1 = blend_estimate(rev_0y_avg, standalone_rev_1, operating_estimate_weight)
-    forward_revenue_year2 = blend_estimate(rev_1y_avg, standalone_rev_2, operating_estimate_weight)
+    forward_revenue_year1 = blend_estimate(rev_0y_avg, standalone_rev_1, revenue_estimate_weight)
+    forward_revenue_year2 = blend_estimate(rev_1y_avg, standalone_rev_2, revenue_estimate_weight)
     forward_revenue_year1, forward_revenue_year2 = complete_forward_revenue_path(
         forward_revenue_year1,
         forward_revenue_year2,
@@ -1352,14 +1451,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     )
 
     scenario_revenue_year1 = {
-        "Bear": blend_estimate(rev_0y_low, standalone_rev_1, operating_estimate_weight),
+        "Bear": blend_estimate(rev_0y_low, standalone_rev_1, revenue_estimate_weight),
         "Base": forward_revenue_year1,
-        "Bull": blend_estimate(rev_0y_high, standalone_rev_1, operating_estimate_weight),
+        "Bull": blend_estimate(rev_0y_high, standalone_rev_1, revenue_estimate_weight),
     }
     scenario_revenue_year2 = {
-        "Bear": blend_estimate(rev_1y_low, standalone_rev_2, operating_estimate_weight),
+        "Bear": blend_estimate(rev_1y_low, standalone_rev_2, revenue_estimate_weight),
         "Base": forward_revenue_year2,
-        "Bull": blend_estimate(rev_1y_high, standalone_rev_2, operating_estimate_weight),
+        "Bull": blend_estimate(rev_1y_high, standalone_rev_2, revenue_estimate_weight),
     }
     for scenario_map in (scenario_revenue_year1, scenario_revenue_year2):
         bear_value, base_value, bull_value = normalize_scenario_estimates(
@@ -1369,57 +1468,142 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         )
         scenario_map.update(Bear=bear_value, Base=base_value, Bull=bull_value)
 
-    # Reject EPS estimates that imply an impossible period-matched net margin. Never
-    # repair them with a power-of-ten conversion.
-    def validated_eps(eps_value, revenue_value):
-        eps_value = positive_float(eps_value)
-        revenue_value = positive_float(revenue_value)
-        if eps_value is None or revenue_value is None or share_count <= 0:
+    # Reject or shrink annual EPS that is inconsistent with 0q/+1q margins.
+    # This admits a corroborated HBM margin regime while protecting OSAT, test,
+    # packaging and power names from malformed annual provider estimates.
+    quarterly_eps_revenue_pairs = [
+        (eps_0q_avg, rev_0q_avg),
+        (eps_1q_avg, rev_1q_avg),
+    ]
+    current_net_margin = safe_ratio(net_income_ttm, revenue_ttm, None)
+
+    def validated_eps(eps_value, revenue_value, label="annual"):
+        result = reconcile_forward_eps_estimate(
+            eps_value,
+            revenue_value,
+            share_count,
+            quarterly_pairs=quarterly_eps_revenue_pairs,
+            current_net_margin=current_net_margin,
+            absolute_margin_cap=(
+                memory_policy.get("forward_ebit_margin_cap", 0.90)
+                if memory_policy else 0.90
+            ),
+        )
+        value = result.get("value")
+        if value is None:
             return None
-        implied_margin = eps_value * share_count / revenue_value
-        return eps_value if -0.25 <= implied_margin <= 0.75 else None
+        if result.get("status") == "shrunk-to-evidence-envelope":
+            print(
+                f"EPS evidence guard ({label}): implied net margin "
+                f"{result['implied_margin']:.1%} exceeded the "
+                f"{result['margin_cap']:.1%} quarterly/current envelope; "
+                "the estimate was shrunk rather than rescaled."
+            )
+
+        # Thin EPS coverage is shrunk toward the company's own current/normalized
+        # economics. Two corroborating quarters permit more of the annual estimate.
+        standalone_margin = finite_median([
+            current_net_margin,
+            normalized_ebit_margin * (1 - effective_tax_rate),
+        ], None)
+        standalone_margin = (
+            clamp(standalone_margin, 0.0, result.get("margin_cap") or 0.90)
+            if standalone_margin is not None else None
+        )
+        standalone_eps = (
+            revenue_value * standalone_margin / share_count
+            if standalone_margin is not None and revenue_value and share_count > 0
+            else None
+        )
+        estimate_weight = eps_estimate_weight
+        if result.get("quarterly_evidence_count", 0) >= 2:
+            estimate_weight = max(estimate_weight, 0.85)
+        return blend_estimate(value, standalone_eps, estimate_weight)
 
 
-    # EPS and revenue must be checked against the same forecast period. Comparing
-    # consensus EPS with a shrinkage-blended revenue denominator falsely rejected
-    # Sandisk's high-margin NAND estimates and removed the forward valuation leg.
-    forward_eps_year1 = validated_eps(eps_0y_avg, rev_0y_avg or forward_revenue_year1)
-    forward_eps_year2 = validated_eps(eps_1y_avg, rev_1y_avg or forward_revenue_year2)
+    # EPS and revenue are checked against the same forecast period. Low/high FY0
+    # values are retained because 12-month calendarization can be materially
+    # between FY0 and FY+1 for December fiscal-year companies such as TSM.
+    forward_eps_year1 = validated_eps(
+        eps_0y_avg, rev_0y_avg or forward_revenue_year1, "FY0 base"
+    )
+    forward_eps_year1_low = validated_eps(
+        eps_0y_low,
+        rev_0y_low or scenario_revenue_year1.get("Bear") or forward_revenue_year1,
+        "FY0 low",
+    )
+    forward_eps_year1_high = validated_eps(
+        eps_0y_high,
+        rev_0y_high or scenario_revenue_year1.get("Bull") or forward_revenue_year1,
+        "FY0 high",
+    )
+    forward_eps_year2 = validated_eps(
+        eps_1y_avg, rev_1y_avg or forward_revenue_year2, "FY+1 base"
+    )
     forward_eps_year2_low = validated_eps(
         eps_1y_low,
         rev_1y_low or scenario_revenue_year2.get("Bear") or forward_revenue_year2,
+        "FY+1 low",
     )
     forward_eps_year2_high = validated_eps(
         eps_1y_high,
         rev_1y_high or scenario_revenue_year2.get("Bull") or forward_revenue_year2,
+        "FY+1 high",
     )
     if forward_eps_year2 is None:
-        forward_eps_year2 = validated_eps(info.get("forwardEps"), forward_revenue_year2)
+        forward_eps_year2 = validated_eps(
+            info.get("forwardEps"), forward_revenue_year2, "provider forward"
+        )
 
-    # A sell-side target is normally a 12-month value, while +1y estimates can end at
-    # a fiscal year boundary before or after that date. Roll the next-fiscal-year
-    # operating base forward by half of a faded growth year. This uses no target price.
-    target_date_growth_roll = clamp(
-        0.50 * (0.60 * standalone_growth_anchor + 0.40 * long_term_growth_estimate),
-        -0.08,
-        0.18 if valuation_archetype_id != "MEMORY_STORAGE" else 0.12,
+    # Map FY0/FY+1 estimates to the actual date one year from now. This replaces
+    # the old fixed half-year extrapolation that overstated MU and TSM differently.
+    fiscal_year_end = info.get("nextFiscalYearEnd")
+    projection_as_of = datetime.now(timezone.utc)
+    target_revenue_projection = calendarize_fiscal_estimate(
+        forward_revenue_year1,
+        forward_revenue_year2,
+        fiscal_year_end,
+        as_of=projection_as_of,
     )
-    target_date_revenue = forward_revenue_year2 * (1 + target_date_growth_roll) if forward_revenue_year2 else None
+    target_date_revenue = target_revenue_projection.get("value")
+    fiscal_next_year_weight = target_revenue_projection.get("next_fy_weight")
+    fiscal_projection_quality = target_revenue_projection.get("quality")
 
+    scenario_target_revenues = {
+        name: calendarize_fiscal_estimate(
+            scenario_revenue_year1.get(name) or forward_revenue_year1,
+            scenario_revenue_year2.get(name) or forward_revenue_year2,
+            fiscal_year_end,
+            as_of=projection_as_of,
+        ).get("value")
+        for name in ("Bear", "Base", "Bull")
+    }
 
     def scenario_target_date_revenue(name):
-        revenue = scenario_revenue_year2.get(name) or forward_revenue_year2
-        return revenue * (1 + target_date_growth_roll) if revenue else None
+        return scenario_target_revenues.get(name) or target_date_revenue
 
-
-    eps_roll = 0.0
-    if forward_eps_year2 is not None:
-        eps_roll = target_date_growth_roll
-        if valuation_archetype_id == "MEMORY_STORAGE":
-            eps_roll = clamp(eps_roll, -0.05, 0.08)
-        target_date_eps = forward_eps_year2 * (1 + eps_roll)
-    else:
-        target_date_eps = None
+    target_eps_projection = calendarize_fiscal_estimate(
+        forward_eps_year1,
+        forward_eps_year2,
+        fiscal_year_end,
+        as_of=projection_as_of,
+    )
+    target_date_eps = target_eps_projection.get("value")
+    scenario_target_eps = {
+        "Bear": calendarize_fiscal_estimate(
+            forward_eps_year1_low or forward_eps_year1,
+            forward_eps_year2_low or forward_eps_year2,
+            fiscal_year_end,
+            as_of=projection_as_of,
+        ).get("value"),
+        "Base": target_date_eps,
+        "Bull": calendarize_fiscal_estimate(
+            forward_eps_year1_high or forward_eps_year1,
+            forward_eps_year2_high or forward_eps_year2,
+            fiscal_year_end,
+            as_of=projection_as_of,
+        ).get("value"),
+    }
 
     revision_adjustment = clamp(revision_breadth or 0.0, -1.0, 1.0) * 0.03
 
@@ -1437,6 +1621,13 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     forward_margin_year1 = eps_implied_ebit_margin(forward_eps_year1, forward_revenue_year1)
     forward_margin_year2 = eps_implied_ebit_margin(forward_eps_year2, forward_revenue_year2)
+    target_margin_by_scenario = {
+        name: eps_implied_ebit_margin(
+            scenario_target_eps.get(name),
+            scenario_target_date_revenue(name),
+        )
+        for name in ("Bear", "Base", "Bull")
+    }
 
     memory_structural_transition = bool(
         memory_policy
@@ -1445,7 +1636,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         and rev_0y_avg is not None
         and rev_1y_avg is not None
         and safe_ratio(rev_1y_avg, rev_0y_avg, 1.0) - 1.0 > 0.10
-        and operating_estimate_count >= 5
+        and eps_estimate_count >= 5
     )
 
     # Normalized margin depends on the economics of the specific AI sub-sector.
@@ -1527,8 +1718,20 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         params = scenario_parameters(name)
         years = config["forecast_years"]
         rev0 = revenue_ttm or forward_revenue_year1
-        selected_rev1 = scenario_revenue_year1.get(name) or forward_revenue_year1
-        selected_rev2 = scenario_revenue_year2.get(name) or forward_revenue_year2
+        # Year one in a present-value model is the next twelve months, not the
+        # provider's possibly-near FY0 boundary. Use the same calendarized base as
+        # the 12-month relative methods.
+        selected_rev1 = scenario_target_date_revenue(name) or forward_revenue_year1
+        fiscal_rev1 = scenario_revenue_year1.get(name) or forward_revenue_year1
+        fiscal_rev2 = scenario_revenue_year2.get(name) or forward_revenue_year2
+        fiscal_growth = (
+            safe_ratio(fiscal_rev2, fiscal_rev1, 1.0) - 1.0
+            if fiscal_rev1 and fiscal_rev2 else standalone_growth_anchor
+        )
+        selected_rev2 = (
+            selected_rev1 * (1 + fiscal_growth)
+            if selected_rev1 is not None else fiscal_rev2
+        )
         g1 = safe_ratio(selected_rev1, rev0, 1.0) - 1.0 if rev0 else standalone_growth_anchor
         g2 = safe_ratio(selected_rev2, selected_rev1, 1.0) - 1.0 if selected_rev1 else standalone_growth_anchor
         g1 += revision_adjustment
@@ -1562,7 +1765,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     def build_margin_path(name):
         params = scenario_parameters(name)
         years = config["forecast_years"]
-        base_start = forward_margin_year1
+        base_start = target_margin_by_scenario.get(name)
+        if base_start is None:
+            base_start = forward_margin_year1
         if base_start is None:
             base_start = current_operating_margin if current_operating_margin is not None else historical_margin_anchor
         second = forward_margin_year2 if forward_margin_year2 is not None else base_start
@@ -1711,17 +1916,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     def scenario_forward_eps(name):
         params = scenario_parameters(name)
-        selected_eps = (
-            forward_eps_year2_low if name == "Bear"
-            else forward_eps_year2_high if name == "Bull"
-            else forward_eps_year2
-        )
-        if selected_eps is not None:
-            selected_eps *= 1 + eps_roll
+        selected_eps = scenario_target_eps.get(name)
         base = selected_eps or target_date_eps or forward_eps_year2 or forward_eps_year1
         if base is None:
             # Derive EPS from normalized operating economics when sell-side EPS is unusable.
-            revenue = forward_revenue_year2 or forward_revenue_year1
+            revenue = scenario_target_date_revenue(name) or forward_revenue_year2 or forward_revenue_year1
             if revenue:
                 ebit = revenue * target_operating_margin
                 net_income = max((ebit - interest_ttm) * (1 - effective_tax_rate), 0.0)
@@ -1729,8 +1928,12 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         if base is None:
             return None
         range_supplied = (
-            (name == "Bear" and forward_eps_year2_low is not None)
-            or (name == "Bull" and forward_eps_year2_high is not None)
+            (name == "Bear" and (
+                forward_eps_year1_low is not None or forward_eps_year2_low is not None
+            ))
+            or (name == "Bull" and (
+                forward_eps_year1_high is not None or forward_eps_year2_high is not None
+            ))
         )
         stress_scale = 0.25 if range_supplied else 1.0
         scenario_multiplier = (
@@ -1952,23 +2155,11 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
 
     def robust_weighted_composite(values, weights, band):
-        valid = {key: value for key, value in values.items() if key in weights and weights[key] > 0}
-        if not valid:
-            return None, {}
-        center = finite_median(valid.values(), None)
-        if center is None or center <= 0:
-            return None, valid
-        low_band, high_band = band
-        winsorized = {
-            key: clamp(value, center * low_band, center * high_band)
-            for key, value in valid.items()
-        }
-        total_weight = sum(weights[key] for key in winsorized)
-        composite = sum(winsorized[key] * weights[key] / total_weight for key in winsorized)
-        return composite, winsorized
+        return robust_method_composite(values, weights, band)
 
 
     scenario_method_values = {}
+    scenario_composite_diagnostics = {}
     scenario_plausible_method_values = {}
     scenario_raw_method_values = {
         scenario_name: method_values(scenario_name)
@@ -1993,20 +2184,30 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
             method: value for method, value in raw_values.items()
             if method not in plausible_values
         })
-        composite, used_values = robust_weighted_composite(
+        composite_result = robust_weighted_composite(
             plausible_values, config["weights"], config["outlier_band"]
         )
+        composite = composite_result.get("value")
+        used_values = composite_result.get("used_values", {})
         scenario_plausible_method_values[scenario_name] = plausible_values
         scenario_method_values[scenario_name] = used_values
+        scenario_composite_diagnostics[scenario_name] = composite_result
         scenario_values[scenario_name] = composite
 
     print(
-        "Base valuation methods (pre-winsorization): "
+        "Base valuation methods (raw, never winsorized): "
         + ", ".join(
             f"{name}=${value:,.2f}"
             for name, value in scenario_raw_method_values.get("Base", {}).items()
         )
     )
+    if scenario_composite_diagnostics.get("Base", {}).get("downweighted_methods"):
+        print(
+            "Robust-composite disagreement downweighted: "
+            + ", ".join(
+                scenario_composite_diagnostics["Base"]["downweighted_methods"]
+            )
+        )
     if scenario_rejected_methods.get("Base"):
         print(
             "WARNING: dimensionally implausible base methods excluded: "
@@ -2051,15 +2252,31 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     if street_gap is not None:
         street_gap -= 1.0
 
+    def uncertainty_aware_rating(objective_value, downside_value, confidence_value=100):
+        upside_value = safe_ratio(
+            objective_value - current_price, current_price, 0.0
+        )
+        downside_upside = safe_ratio(
+            downside_value - current_price, current_price, 0.0
+        )
+        # A point estimate just above 25% is not a strong buy when the downside
+        # case or model confidence disagrees. This removes boundary false precision.
+        if (
+            upside_value >= 0.25
+            and downside_upside >= -0.12
+            and confidence_value >= 65
+        ):
+            return "STRONG BUY", "buy"
+        if upside_value >= 0.10:
+            return "BUY", "buy"
+        if upside_value > -0.10:
+            return "HOLD", "hold"
+        return "SELL", "sell"
+
     upside = safe_ratio(intrinsic_value - current_price, current_price, 0.0)
-    if upside >= 0.25:
-        model_rating, rating_class = "STRONG BUY", "buy"
-    elif upside >= 0.10:
-        model_rating, rating_class = "BUY", "buy"
-    elif upside > -0.10:
-        model_rating, rating_class = "HOLD", "hold"
-    else:
-        model_rating, rating_class = "SELL", "sell"
+    model_rating, rating_class = uncertainty_aware_rating(
+        intrinsic_value, bear_price
+    )
 
     rsi_class = "buy" if rsi_14 < 30 else "sell" if rsi_14 > 70 else "hold"
     fair_value_low = bear_price
@@ -2071,6 +2288,8 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     # Confidence comes from source quality and agreement among independent methods,
     # not from closeness to Wall Street.
     base_methods = scenario_plausible_method_values.get("Base", {})
+    base_composite_diagnostic = scenario_composite_diagnostics.get("Base", {})
+    base_method_family_count = int(base_composite_diagnostic.get("family_count") or 0)
     method_dispersion = None
     if len(base_methods) >= 2:
         method_series = pd.Series(list(base_methods.values()), dtype="float64")
@@ -2084,12 +2303,23 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         data_quality_score += 0.08
     if normalized_peer_count >= 3:
         data_quality_score += 0.12
-    if len(base_methods) >= 2:
+    if len(base_methods) >= 2 and base_method_family_count >= 2:
         data_quality_score += 0.12
     if forward_eps_year2 or valuation_archetype_id in {"AI_SOFTWARE", "AI_CLOUD_INFRA"}:
         data_quality_score += 0.08
     if method_dispersion is not None:
         data_quality_score -= clamp(method_dispersion - 0.20, 0.0, 0.25)
+    downweighted_method_count = len(
+        base_composite_diagnostic.get("downweighted_methods") or []
+    )
+    if downweighted_method_count:
+        data_quality_score -= min(0.15, 0.05 * downweighted_method_count)
+    if base_method_family_count < 2:
+        data_quality_score -= 0.12
+    if fiscal_projection_quality != "calendarized":
+        data_quality_score -= 0.08
+    if eps_estimate_count < 3 and "Forward P/E" in base_methods:
+        data_quality_score -= 0.08
     rejected_base_count = len(scenario_rejected_methods.get("Base", {}))
     if rejected_base_count:
         data_quality_score -= min(0.18, rejected_base_count * 0.05)
@@ -2103,7 +2333,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     print(
         f"Architecture: {valuation_archetype}; peers={peer_count} "
         f"({normalized_peer_count} currency-normalized); "
-        f"operating-estimate weight={operating_estimate_weight:.0%}; "
+        f"revenue/EPS estimate weights={revenue_estimate_weight:.0%}/"
+        f"{eps_estimate_weight:.0%}; fiscal calendar FY+1 weight="
+        f"{fiscal_next_year_weight:.0%}; "
         f"pre-calibration analyst-target weight=0%; independent fair value=${intrinsic_value:,.2f}; "
         f"Street comparison={street_comparison}."
     )
@@ -2770,17 +3002,6 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     research_price_objective = analyst_target_policy["objective"] or intrinsic_value
     analyst_target_weight = float(analyst_target_policy["weight"] or 0.0)
     fundamental_target = research_price_objective
-    objective_upside = safe_ratio(
-        research_price_objective - current_price, current_price, 0.0
-    )
-    if objective_upside >= 0.25:
-        model_rating, rating_class = "STRONG BUY", "buy"
-    elif objective_upside >= 0.10:
-        model_rating, rating_class = "BUY", "buy"
-    elif objective_upside > -0.10:
-        model_rating, rating_class = "HOLD", "hold"
-    else:
-        model_rating, rating_class = "SELL", "sell"
     accumulation_zone = research_price_objective * 0.85
     high_conviction_zone = min(research_price_objective * 0.75, fair_value_low * 0.95)
     methodology = (
@@ -2791,6 +3012,9 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         model_confidence = min(model_confidence, 40)
     if len(scenario_method_values.get("Base", {})) < 2:
         model_confidence = min(model_confidence, 48)
+    model_rating, rating_class = uncertainty_aware_rating(
+        research_price_objective, fair_value_low, model_confidence
+    )
     print(
         f"Final 12-month objective=${research_price_objective:,.2f}; "
         f"independent=${intrinsic_value:,.2f}; analyst anchor="
@@ -2938,6 +3162,14 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
         if not cross_currency_financials
         else "Financial-statement FX was unresolved; currency-dependent methods were omitted and confidence was capped."
     )
+    fiscal_projection_note = (
+        f"The 12-month operating base is {fiscal_projection_quality}; "
+        f"FY+1 receives {fiscal_next_year_weight:.0%} weight and FY0 receives "
+        f"{1 - fiscal_next_year_weight:.0%} weight based on the issuer's actual "
+        "fiscal year-end."
+        if fiscal_next_year_weight is not None
+        else f"The 12-month operating base used {fiscal_projection_quality}."
+    )
     analyst_count_parts = []
     if analyst_target_policy.get("verified_count"):
         analyst_count_parts.append(
@@ -2964,7 +3196,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>{TICKER_SYMBOL} Compact Institutional Report v9.0</title>
+        <title>{TICKER_SYMBOL} Compact Institutional Report v{REPORT_ENGINE_VERSION}</title>
         <style>
             body {{ font-family: 'Segoe UI', Arial, sans-serif; background:#f4f7f6; color:#333; margin:0; padding:24px; }}
             .container {{ max-width:1080px; margin:auto; background:#fff; padding:34px; border-radius:8px; box-shadow:0 3px 14px rgba(0,0,0,.08); }}
@@ -3044,7 +3276,7 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
                 <td>Based on the evidence-calibrated 12-month objective relative to the current price.</td>
             </tr>
         </table>
-        <div class="note"><strong>Architecture:</strong> {escape(valuation_archetype)}. Analyst price-target weight: {analyst_target_weight:.0%}. FY1/FY2 operating-estimate weight: {operating_estimate_weight:.0%}. Independent model versus Street: {escape(street_comparison)}. Model confidence: {model_confidence}%.<br><br><strong>Analyst calibration:</strong> {escape(analyst_policy_note)}<br><br><strong>Unit policy:</strong> {escape(currency_unit_note)}</div>
+        <div class="note"><strong>Primary architecture:</strong> {escape(valuation_archetype)}. <strong>Secondary AI-chain exposure:</strong> {escape(secondary_ai_exposure_text)}. Analyst price-target weight: {analyst_target_weight:.0%}. Revenue/EPS estimate weights: {revenue_estimate_weight:.0%} / {eps_estimate_weight:.0%}. Independent model versus Street: {escape(street_comparison)}. Model confidence: {model_confidence}%.<br><br><strong>Fiscal-calendar policy:</strong> {escape(fiscal_projection_note)}<br><br><strong>Analyst calibration:</strong> {escape(analyst_policy_note)}<br><br><strong>Unit policy:</strong> {escape(currency_unit_note)}</div>
 
         <h2>2. Latest Verified Wall Street Action Per Firm — {REPORT_YEAR} YTD</h2>
         <div class="summary-grid">
@@ -3104,7 +3336,10 @@ def generate_report(TICKER_SYMBOL, output_dir=None):
 
     output_dir = os.path.abspath(output_dir or os.getcwd())
     os.makedirs(output_dir, exist_ok=True)
-    html_path = os.path.join(output_dir, f"{TICKER_SYMBOL}_AI_Valuation_Report_v9_0.html")
+    html_path = os.path.join(
+        output_dir,
+        f"{TICKER_SYMBOL}_AI_Valuation_Report_{REPORT_FILE_VERSION}.html",
+    )
     with open(html_path, "w", encoding="utf-8") as file:
         file.write(html_content)
 
@@ -3214,6 +3449,7 @@ def run_batch(ticker_input, output_dir=None):
         print(f"  ERROR {ticker}: {message}")
 
     return {
+        "engine_version": REPORT_ENGINE_VERSION,
         "tickers": tickers,
         "reports": generated_paths,
         "zip": zip_path,
